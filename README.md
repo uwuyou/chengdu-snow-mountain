@@ -36,11 +36,14 @@ python chengdu_snow_mountain.py
 
 ### Render（免费额度，可能需要手机验证）
 
-1. 将本仓库导入 Render（New + → Web Service → 连接 GitHub 仓库）
-2. 配置：
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `python chengdu_snow_mountain.py`
-   - 环境变量 `PORT` 会自动注入
+**一键部署（推荐）**：仓库根目录已提供 `render.yaml`（Render Blueprint）。
+
+1. 在 [render.com](https://render.com) 用 GitHub 账号登录
+2. 后台选择 **New + → Blueprint**，连接本仓库
+3. 自动读取 `render.yaml` 创建并部署 `chengdu-snow-mountain` Web 服务
+4. 部署完成后会分配固定公网地址 `https://chengdu-snow-mountain.onrender.com`
+
+> 免费实例 15 分钟无流量会进入休眠，下次访问自动唤醒（首屏稍慢属正常）。
 
 ### Railway / Fly.io / PythonAnywhere
 

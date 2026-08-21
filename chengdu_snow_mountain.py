@@ -678,6 +678,298 @@ def obs_sat_url(now=None):
     return None
 
 
+# ---- v2.10.12: 风云四号红外云图（NSMC 官方 WMS 接口，24 小时可用） ----
+# 数据源：国家卫星气象中心 WMS 服务 GEOS_IRX（全球静止卫星 10.8μm 红外拼图，含风云四号，逐小时）
+# 服务端限制：bbox 经度跨度需 ≥55° 且图片宽度 ≤700px；故拉取大范围图后裁剪出四川/川西区域并放大。
+FY4_WMS_BASE = "https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/compose"
+FY4_WMS_TIME_URL = ("https://data.nsmc.org.cn/nsmcapi/v1/nsmc/image/animation/datatime/mongodb"
+                    "?dataCode=GEO_MULT_GBAL_L2_GGM_IRX_GLL_YYYYMMDD_HHmm_4000M.PNG&hourRange=24")
+# 请求的大范围（西边界必须 ≤70、东边界-西边界 ≥55°，服务端限制）
+FY4_WMS_BBOX = "70,10,135,55"          # 覆盖中国大部 + 西南，满足跨度 ≥55°
+FY4_WMS_W, FY4_WMS_H = 700, 700
+# 裁剪出的川西走廊范围（含成都平原 + 川西雪山带）
+FY4_CROP = {"lon0": 96.5, "lon1": 112.0, "lat0": 24.0, "lat1": 36.5}
+FY4_OUT_W = 900                         # 输出图宽度（放大后）
+
+def fy4_irx_png(now=None):
+    """拉取最新风云四号红外云图并裁剪川西区域，返回 (PNG字节, 时次dict) 或 None。
+    缓存 10 分钟。"""
+    cached = cache_get("obs:fy4irx", 600)
+    if cached is not None: return cached
+    try:
+        now = now or datetime.now(TZ)
+        # 1) 查询最新可用时次
+        r = SESSION.get(FY4_WMS_TIME_URL, timeout=20)
+        r.raise_for_status()
+        ds = r.json().get("ds") or []
+        if not ds:
+            return None
+        latest = ds[-1]
+        dt = latest["dataDate"] + (latest["dataTime"] or "")[:4]   # YYYYMMDDHHmm
+        # 2) 请求大范围红外云图（白色云 + 透明底）
+        r2 = SESSION.get(FY4_WMS_BASE, params={
+            "layers": "GEOS_IRX", "datetime": dt, "request": "GetMap",
+            "bbox": FY4_WMS_BBOX, "width": FY4_WMS_W, "height": FY4_WMS_H,
+            "version": "1.1.0", "format": "png",
+        }, timeout=30)
+        r2.raise_for_status()
+        if not r2.content or len(r2.content) < 2000:
+            return None  # 空白图（无数据）
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(r2.content)).convert("RGBA")
+        # 3) 裁剪川西范围（等距投影：x 与经度线性、y 与纬度线性）
+        lon0, lon1 = float(FY4_WMS_BBOX.split(",")[0]), float(FY4_WMS_BBOX.split(",")[2])
+        lat1, lat0 = float(FY4_WMS_BBOX.split(",")[3]), float(FY4_WMS_BBOX.split(",")[1])
+        c = FY4_CROP
+        px0 = int((c["lon0"] - lon0) / (lon1 - lon0) * img.width)
+        px1 = int((c["lon1"] - lon0) / (lon1 - lon0) * img.width)
+        py0 = int((lat1 - c["lat1"]) / (lat1 - lat0) * img.height)
+        py1 = int((lat1 - c["lat0"]) / (lat1 - lat0) * img.height)
+        crop = img.crop((px0, py0, px1, py1))
+        # 4) 放大（LANCZOS 保细节）
+        oh = int(FY4_OUT_W * crop.height / crop.width)
+        out = crop.resize((FY4_OUT_W, oh), Image.LANCZOS)
+        buf = _io.BytesIO()
+        out.save(buf, format="PNG")
+        # 5) 标注时次（北京时间）
+        t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        t_bj = t_utc.astimezone(TZ)
+        info = {"time_utc": dt, "time_bj": t_bj.isoformat(),
+                "bbox": [c["lat0"], c["lon0"], c["lat1"], c["lon1"]],
+                "width": FY4_OUT_W, "height": oh}
+        out_data = {"png": buf.getvalue(), "info": info}
+        cache_put("obs:fy4irx", out_data)
+        return out_data
+    except Exception as e:
+        print(f"[fy4_irx] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# ---- v2.10.13: 风云四号实况云况分析（近似云掩膜 CLM + 云顶高度分层） ----
+# 云掩膜：NSMC WMS GEOS_IRX 二值云检测图（白=云、黑=晴，已用 18 个机场 METAR 交叉验证）。
+# 云顶分层：Open-Meteo 数值模式低/中/高云量近似（无 API Key 的替代方案）。
+def fy4_cloud_analysis(lat, lon, now=None):
+    """返回观测点及周边风云四号红外云检测统计 + 云顶高度分层，缓存 10 分钟。失败返回 None。"""
+    key = f"obs:fy4clm:{float(lat):.2f},{float(lon):.2f}"
+    cached = cache_get(key, 600)
+    if cached is not None: return cached
+    try:
+        now = now or datetime.now(TZ)
+        # 1) 最新时次（与红外云图同一接口）
+        r = SESSION.get(FY4_WMS_TIME_URL, timeout=20)
+        r.raise_for_status()
+        ds = (r.json().get("ds") or [])
+        if not ds: return None
+        latest = ds[-1]
+        dt = latest["dataDate"] + (latest["dataTime"] or "")[:4]
+        # 2) 大范围云检测二值图（bbox 经度跨度需 ≥55°，服务端限制）
+        r2 = SESSION.get(FY4_WMS_BASE, params={
+            "layers": "GEOS_IRX", "datetime": dt, "request": "GetMap",
+            "bbox": FY4_WMS_BBOX, "width": FY4_WMS_W, "height": FY4_WMS_H,
+            "version": "1.1.0", "format": "png",
+        }, timeout=30)
+        r2.raise_for_status()
+        if not r2.content or len(r2.content) < 2000: return None
+        from PIL import Image as _Img
+        img = _Img.open(io.BytesIO(r2.content)).convert("L")
+        px = img.load()
+        W, H = img.size
+        # 地理范围：lon 70→135（x 从左到右），lat 55→10（y 从上到下）
+        lon0, lon1, lat1, lat0 = 70.0, 135.0, 55.0, 10.0
+        cx = int((lon - lon0) / (lon1 - lon0) * W)
+        cy = int((lat1 - lat) / (lat1 - lat0) * H)
+        cx = max(0, min(W - 1, cx)); cy = max(0, min(H - 1, cy))
+        # 中心像元：灰度 ≥128 视为云（白=云）
+        center_cloud = bool(px[cx, cy] >= 128)
+        # 周围 9×9=81 像元统计（约 90km×90km 范围，4km 源数据经服务端降采样）
+        r_ = 4
+        n_cloud = n_clear = 0
+        for yy in range(max(0, cy - r_), min(H, cy + r_ + 1)):
+            for xx in range(max(0, cx - r_), min(W, cx + r_ + 1)):
+                if px[xx, yy] >= 128:
+                    n_cloud += 1
+                else:
+                    n_clear += 1
+        total = n_cloud + n_clear
+        stats = {
+            "total": total, "valid": total,
+            "valid_rate": round(total / total * 100, 1) if total else 0.0,
+            "cloudy": n_cloud,
+            "cloudy_rate": round(n_cloud / total * 100, 1) if total else 0.0,
+            "clear": n_clear,
+            "clear_rate": round(n_clear / total * 100, 1) if total else 0.0,
+            "cloud_ratio": round(n_cloud / total * 100, 1) if total else 0.0,
+            "clear_ratio": round(n_clear / total * 100, 1) if total else 0.0,
+        }
+        t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        t_bj = t_utc.astimezone(TZ)
+        # 3) 云顶高度分层：Open-Meteo 当前时次低/中/高云量（近似）
+        top = None
+        try:
+            om = SESSION.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": lat, "longitude": lon,
+                "current": "cloud_cover_low,cloud_cover_mid,cloud_cover_high",
+            }, timeout=20)
+            om.raise_for_status()
+            c = om.json().get("current") or {}
+            top = {"low": c.get("cloud_cover_low"), "mid": c.get("cloud_cover_mid"),
+                   "high": c.get("cloud_cover_high")}
+        except Exception as e:
+            print(f"[fy4_cloud top] {type(e).__name__}: {e}", flush=True)
+        out = {
+            "time_utc": dt, "time_bj": t_bj.isoformat(),
+            "center": {"lat": round(lat, 4), "lon": round(lon, 4),
+                       "row": cy, "col": cx,
+                       "cloud": center_cloud,
+                       "text": "有云" if center_cloud else "晴空"},
+            "stats": stats, "top": top,
+            "note": "云况基于国家卫星气象中心风云四号红外云检测（GEOS_IRX，白=云）；"
+                    "云顶分层基于 Open-Meteo 数值模式（低/中/高云量）近似",
+        }
+        cache_put(key, out)
+        return out
+    except Exception as e:
+        print(f"[fy4_cloud] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# ---- v2.10.14: NASA GIBS 卫星云顶高度（免登录，Himawari 红外 + MODIS CTH） ----
+# 数据源：NASA GIBS WMS（gibs.earthdata.nasa.gov），免登录免费。
+#  - Himawari_AHI_Band13_Clean_Infrared：10.4µm 增强红外，灰度 0-255 线性映射 TBB
+#    -92.6℃(白/冷) ~ +57℃(黑/暖)，灰度越高=云顶越冷越高，10 分钟时次（GIBS 有数小时延迟）
+#  - MODIS_Aqua/Terra_Cloud_Top_Height_Day：彩虹色标 0-20km 定量云顶高度，日级（每天过境 2-4 次）
+# 注意：WMS 1.3.0 + EPSG:4326 的 BBOX 轴序为 纬度优先(lat,lon)。
+GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/"
+GIBS_BBOX = "24,96,37,112"      # 川西（纬度,经度 轴序）
+GIBS_W, GIBS_H = 640, 520
+# MODIS CTH 彩虹色标锚点（从 GIBS 官方图例提取，0%→100% 对应 0→20km）
+GIBS_CTH_ANCHORS = [(0, (241, 0, 0)), (6.25, (170, 0, 0)), (12.5, (110, 0, 0)),
+                    (18.75, (112, 1, 2)), (25, (124, 91, 5)), (31.25, (240, 190, 64)),
+                    (37.5, (255, 255, 0)), (43.75, (0, 220, 0)), (50, (0, 136, 0)),
+                    (56.25, (0, 80, 0)), (62.5, (0, 80, 0)), (68.75, (0, 136, 238)),
+                    (75, (0, 0, 255)), (81.25, (0, 0, 170)), (87.5, (0, 0, 100)),
+                    (93.75, (183, 15, 141)), (100, (102, 0, 119))]
+GIBS_CTH_MAX = 20.0  # km
+
+
+def _gibs_color_pos(r, g, b, anchors):
+    """在锚点色标中找最近颜色对应的位置百分比(0-100)。"""
+    best, best_d = 0.0, 1e18
+    for pos, (ar, ag, ab) in anchors:
+        d = (r - ar) ** 2 + (g - ag) ** 2 + (b - ab) ** 2
+        if d < best_d:
+            best_d, best = d, pos
+    return best
+
+
+def gibs_cloud_analysis(lat, lon):
+    """NASA GIBS 卫星云顶高度分析：Himawari 红外灰度分级 + MODIS CTH 定量统计。缓存 15 分钟。"""
+    key = f"obs:gibs:{float(lat):.2f},{float(lon):.2f}"
+    cached = cache_get(key, 900)
+    if cached is not None: return cached
+    try:
+        from PIL import Image as _Img
+        # bbox 常量解析：GIBS_BBOX="lat_min,lon_min,lat_max,lon_max"
+        bbox = [float(v) for v in GIBS_BBOX.split(",")]
+        lat_bot, lon_left, lat_top, lon_right = bbox
+        out = {"ir13": None, "cth": None, "note": ""}
+        # 1) Himawari 红外（最新时次，近实时参考）
+        try:
+            r = SESSION.get(GIBS_WMS, params={
+                "SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.3.0",
+                "LAYERS": "Himawari_AHI_Band13_Clean_Infrared", "FORMAT": "image/png",
+                "TRANSPARENT": "TRUE", "BBOX": GIBS_BBOX, "CRS": "EPSG:4326",
+                "WIDTH": GIBS_W, "HEIGHT": GIBS_H,
+            }, timeout=40)
+            r.raise_for_status()
+            img = _Img.open(io.BytesIO(r.content)).convert("L")
+            g = img.load(); W, H = img.size
+            cx = int((lon - lon_left) / (lon_right - lon_left) * W)
+            cy = int((lat_top - lat) / (lat_top - lat_bot) * H)
+            cx = max(0, min(W - 1, cx)); cy = max(0, min(H - 1, cy))
+            # 9x9 像元灰度统计（约 55km 范围）
+            rr = 4
+            vals = []
+            for yy in range(max(0, cy - rr), min(H, cy + rr + 1)):
+                for xx in range(max(0, cx - rr), min(W, cx + rr + 1)):
+                    vals.append(g[xx, yy])
+            if vals:
+                # 灰度 → TBB（0=+57℃暖 → 255=-92.6℃冷），越高=云顶越冷越高
+                tbbs = [57.0 - (v / 255.0) * 149.6 for v in vals]
+                mean_tbb = sum(tbbs) / len(tbbs)
+                def band_of(tbb):
+                    if tbb < -35: return "high"
+                    if tbb < -12: return "mid"
+                    return "low"
+                n_high = sum(1 for t in tbbs if t < -35)
+                n_mid = sum(1 for t in tbbs if -35 <= t < -12)
+                n_low = sum(1 for t in tbbs if t >= -12)
+                n = len(tbbs)
+                out["ir13"] = {
+                    "time": "最新时次", "total": n,
+                    "mean_tbb": round(mean_tbb, 1),
+                    "high": n_high, "high_rate": round(n_high / n * 100, 1),
+                    "mid": n_mid, "mid_rate": round(n_mid / n * 100, 1),
+                    "low": n_low, "low_rate": round(n_low / n * 100, 1),
+                    "note": "Himawari-8/9 10.4μm 增强红外（NASA GIBS），灰度→亮温线性映射，"
+                            "亮温越低=云顶越高；仅供相对分级参考",
+                }
+        except Exception as e:
+            print(f"[gibs ir13] {type(e).__name__}: {e}", flush=True)
+        # 2) MODIS CTH（白天定量云顶高度）
+        for layer in ["MODIS_Aqua_Cloud_Top_Height_Day", "MODIS_Terra_Cloud_Top_Height_Day"]:
+            try:
+                r = SESSION.get(GIBS_WMS, params={
+                    "SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.3.0",
+                    "LAYERS": layer, "FORMAT": "image/png", "TRANSPARENT": "TRUE",
+                    "BBOX": GIBS_BBOX, "CRS": "EPSG:4326",
+                    "WIDTH": GIBS_W, "HEIGHT": GIBS_H,
+                }, timeout=40)
+                r.raise_for_status()
+                img = _Img.open(io.BytesIO(r.content)).convert("RGBA")
+                px = img.load(); W, H = img.size
+                cx = int((lon - lon_left) / (lon_right - lon_left) * W)
+                cy = int((lat_top - lat) / (lat_top - lat_bot) * H)
+                cx = max(0, min(W - 1, cx)); cy = max(0, min(H - 1, cy))
+                rr = 4
+                heights = []
+                for yy in range(max(0, cy - rr), min(H, cy + rr + 1)):
+                    for xx in range(max(0, cx - rr), min(W, cx + rr + 1)):
+                        pr, pg, pb, pa = px[xx, yy]
+                        if pa < 128:  # 透明=无数据/晴空
+                            continue
+                        pos = _gibs_color_pos(pr, pg, pb, GIBS_CTH_ANCHORS)
+                        heights.append(pos / 100.0 * GIBS_CTH_MAX)
+                if len(heights) >= 5:
+                    heights.sort()
+                    n = len(heights)
+                    n_low = sum(1 for h in heights if h < 3)
+                    n_mid = sum(1 for h in heights if 3 <= h < 7)
+                    n_high = sum(1 for h in heights if h >= 7)
+                    out["cth"] = {
+                        "source": "Aqua" if "Aqua" in layer else "Terra",
+                        "total": n, "max": round(heights[-1], 1),
+                        "min": round(heights[0], 1),
+                        "mean": round(sum(heights) / n, 1),
+                        "median": round(heights[n // 2], 1),
+                        "low": n_low, "low_rate": round(n_low / n * 100, 1),
+                        "mid": n_mid, "mid_rate": round(n_mid / n * 100, 1),
+                        "high": n_high, "high_rate": round(n_high / n * 100, 1),
+                        "note": "MODIS 云顶高度（NASA GIBS 彩虹色标 0-20km），日间过境定量产品",
+                    }
+                    break  # Aqua 有数据就够，否则用 Terra
+            except Exception as e:
+                print(f"[gibs cth {layer}] {type(e).__name__}: {e}", flush=True)
+        if not out["ir13"] and not out["cth"]:
+            return None
+        cache_put(key, out)
+        return out
+    except Exception as e:
+        print(f"[gibs] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 # ---- v2.9.6: 云图未来 3 小时趋势 + 当前云层判断 ----
 # v2.10.7: 实况云型识别（Python 版）——与前端剖面 11 云属多因子判定一致
 GN_ZH_PY = {"ci": "卷云", "cc": "卷积云", "cs": "卷层云", "ac": "高积云", "as": "高层云",
@@ -1649,6 +1941,79 @@ def api_obs():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
 
 
+@APP.get("/api/sat")
+def api_sat():
+    """v2.10.11 返回风云四号 B 星真彩色卫星云图 URL（供 Windy 云图图层叠加真实云图）。"""
+    try:
+        sat = obs_sat_url()
+        if not sat:
+            return jsonify({"ok": False, "error": "风云四号云图暂不可用（当前为日出前/日落后或数据源无响应）"}), 404
+        resp = jsonify({"ok": True, "data": sat})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
+@APP.get("/api/fy4-irx")
+def api_fy4_irx():
+    """v2.10.12 返回风云四号红外云图 PNG（NSMC WMS GEOS_IRX，裁剪川西区域放大，24 小时可用）。"""
+    try:
+        data = fy4_irx_png()
+        if not data:
+            return jsonify({"ok": False, "error": "风云四号红外云图暂不可用（数据源无响应或暂无最新时次）"}), 502
+        return send_file(io.BytesIO(data["png"]), mimetype="image/png",
+                         download_name="fy4_irx.png", max_age=0)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
+@APP.get("/api/fy4-irx/info")
+def api_fy4_irx_info():
+    """v2.10.12 风云四号红外云图元信息（时次/边界/尺寸）。"""
+    try:
+        data = fy4_irx_png()
+        if not data:
+            return jsonify({"ok": False, "error": "风云四号红外云图暂不可用"}), 502
+        resp = jsonify({"ok": True, "data": data["info"]})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
+@APP.get("/api/fy4-cloud")
+def api_fy4_cloud():
+    """v2.10.13 风云四号实况云况分析：中心像元 + 周围 81 像元云掩膜统计 + 云顶高度分层。"""
+    try:
+        lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
+        lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
+        data = fy4_cloud_analysis(lat, lon)
+        if not data:
+            return jsonify({"ok": False, "error": "风云四号云况分析暂不可用（数据源无响应或暂无最新时次）"}), 502
+        resp = jsonify({"ok": True, "data": data})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
+@APP.get("/api/fy4-cloud/gibs")
+def api_fy4_cloud_gibs():
+    """v2.10.14 NASA GIBS 卫星云顶高度：Himawari 红外分级 + MODIS CTH 定量统计。"""
+    try:
+        lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
+        lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
+        data = gibs_cloud_analysis(lat, lon)
+        if not data:
+            return jsonify({"ok": False, "error": "卫星云顶高度暂不可用（NASA GIBS 数据源无响应）"}), 502
+        resp = jsonify({"ok": True, "data": data})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
 @APP.get("/api/cloud-trend")
 def api_cloud_trend():
     """v2.9.6 云图趋势：未来 3 小时云量趋势 + 当前云层判断（Open-Meteo 走廊采样）。"""
@@ -1771,9 +2136,14 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 @media(max-width:980px){.obs-trend{grid-template-columns:1fr}.obs-imgs{grid-template-columns:1fr 1fr}}
 @media(max-width:780px){.grid{grid-template-columns:1fr}.cards{grid-template-columns:1fr}.hero{align-items:flex-start;flex-direction:column}.hero .primary{width:100%}#map{height:290px}#liveMap{height:240px}.sim-metrics{grid-template-columns:repeat(3,1fr)}.sample-list{grid-template-columns:1fr}.obs-imgs{grid-template-columns:1fr}.tabs-nav{overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;padding-bottom:8px;scrollbar-width:none}.tabs-nav::-webkit-scrollbar{display:none}.tab-btn{white-space:nowrap;padding:8px 13px;font-size:13.5px}.cur-panel{gap:12px;padding:12px}.cur-metrics{gap:10px}.cur-temp{font-size:26px}.inputs{grid-template-columns:1fr}.actions{flex-wrap:wrap}.actions button{flex:1}.ct-hours{grid-template-columns:repeat(2,1fr)}.hist-ctl button{flex:1}.hist-ctl input[type=date]{flex:1;min-width:0}.sat-legend{gap:8px;font-size:10px}.panel{padding:13px}.wrap{padding:14px 12px 28px}.hero h1{font-size:24px}}
 @media(max-width:420px){.cur-metrics{font-size:11.5px}.ct-hours{grid-template-columns:1fr 1fr}.tab-btn{padding:8px 10px;font-size:13px}.hist-head{font-size:12.5px}}
+/* v2.10.9: Windy 实况嵌入式板块 */
+.windy-panel{width:100%}.windy-ctl{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}.windy-ctl button{flex:1;min-width:76px;padding:8px 6px;font-size:12px;border-radius:8px;background:#f4f7f9;border-color:#e0e7ec;color:#3b5163;white-space:nowrap}.windy-ctl button.on{background:var(--accent);border-color:var(--accent);color:#fff}.windy-box{position:relative;width:100%;aspect-ratio:16/9;background:#0b1220;border-radius:10px;overflow:hidden;border:1px solid var(--line)}.windy-box iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block}.windy-note{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.7}.windy-note b{color:var(--accent)}.windy-load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8aa0b0;font-size:13px;letter-spacing:1px;background:#0b1220;pointer-events:none;transition:opacity .3s}.windy-box.loading .windy-load{opacity:1}.windy-box .windy-load{opacity:0}
+/* v2.10.10: Windy.app 数值云图瓦片板块（数据源/云量类型切换） */
+.wm-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.wm-ctl .grp{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.wm-ctl .grp b{font-size:11px;color:var(--muted);font-weight:600;margin-right:2px}.wm-ctl button{min-width:0;padding:6px 10px;font-size:12px;border-radius:8px;background:#f4f7f9;border-color:#e0e7ec;color:#3b5163;white-space:nowrap}.wm-ctl button.on{background:var(--accent);border-color:var(--accent);color:#fff}.wm-map{height:420px;border-radius:10px;background:#0b1220;border:1px solid var(--line);position:relative}.wm-note{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.7}.wm-note b{color:var(--accent)}.wm-status{font-size:11px;color:var(--muted);margin:2px 0 8px}.wm-legend{display:flex;gap:10px;flex-wrap:wrap;font-size:10.5px;color:var(--muted);margin-top:5px}.wm-legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:3px}
+@media(max-width:780px){.wm-map{height:320px}.wm-ctl .grp{width:100%}}
 </style></head><body><div class="wrap"><div class="hero"><div><h1>成都 · 看雪山</h1><p>数值预报 × 观山经验 综合测算观测指数</p></div><button class="primary" onclick="loadAll()">刷新全部数据</button></div>
-<nav class="tabs-nav"><button class="tab-btn active" data-tab="fc" onclick="switchTab('fc')">天气预报</button><button class="tab-btn" data-tab="live" onclick="switchTab('live')">实况观测</button><button class="tab-btn" data-tab="hist" onclick="switchTab('hist')">历史回顾</button><button class="tab-btn" data-tab="kb" onclick="switchTab('kb')">观山知识</button></nav>
-<div id="pane-live" class="tab-pane"><div class="panel"><div class="obs-title">观测点地图 <span class="tag2">拖动蓝点调整观测位置 · 松手自动刷新实况与云量趋势</span></div><div id="liveMap"></div><div class="legend"><span>● 观测点（可拖动）</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">当前天气实况 <span class="tag2">中央气象台站点观测 + Open-Meteo 当前时次</span></div><div id="currentBox"><div class="cur-panel" style="justify-content:center;color:var(--muted);font-size:13px">正在获取实况观测…</div></div></div><div id="obsBox" class="panel obs-panel" style="display:none"></div></div>
+<nav class="tabs-nav"><button class="tab-btn active" data-tab="fc" onclick="switchTab('fc')">天气预报</button><button class="tab-btn" data-tab="live" onclick="switchTab('live')">实况观测</button><button class="tab-btn" data-tab="hist" onclick="switchTab('hist')">历史回顾</button><button class="tab-btn" data-tab="kb" onclick="switchTab('kb')">观山知识</button><button class="tab-btn" data-tab="windy" onclick="switchTab('windy')">Windy 实况</button><button class="tab-btn" data-tab="wm" onclick="switchTab('wm')">Windy 云图</button></nav>
+<div id="pane-live" class="tab-pane"><div class="panel"><div class="obs-title">观测点地图 <span class="tag2">拖动蓝点调整观测位置 · 松手自动刷新实况与云量趋势</span></div><div id="liveMap"></div><div class="legend"><span>● 观测点（可拖动）</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">当前天气实况 <span class="tag2">中央气象台站点观测 + Open-Meteo 当前时次</span></div><div id="currentBox"><div class="cur-panel" style="justify-content:center;color:var(--muted);font-size:13px">正在获取实况观测…</div></div></div><div id="obsBox" class="panel obs-panel" style="display:none"></div><div class="panel" style="margin-top:12px"><div class="obs-title">风云四号实况云况分析 <span class="tag2">红外云检测（白=云）· 跟随当前观测点 · 自动刷新</span></div><div id="fy4CloudBox"><div class="hist-note" style="color:var(--muted)">正在获取风云四号云况分析…</div></div></div></div>
 <div id="pane-fc" class="tab-pane active"><div class="grid"><section class="panel"><div class="obs-title">预报设置 <span class="tag2">观测点 · 海拔 · 模型</span></div><div class="inputs"><label>纬度<input id="lat" value="{{observer.lat}}"></label><label>经度<input id="lon" value="{{observer.lon}}"></label><label>海拔 m（自动）<input id="elev" value="读取中" readonly></label><label>地点<input id="name" value="{{observer.name}}"></label><label class="wide">天气预报数据源<select id="model" onchange="loadAll()"><option value="best_match">智能最佳匹配（推荐）</option><option value="ecmwf_ifs025">ECMWF IFS 0.25°</option><option value="gfs_seamless">NOAA GFS</option><option value="icon_seamless">DWD ICON</option><option value="cma_grapes_global">中国气象局 CMA GRAPES</option><option value="jma_seamless">日本气象厅 JMA</option></select></label></div><div class="actions"><button onclick="locate()">手机定位</button><button onclick="loadAll()">更新全部数据</button></div><div id="modelStatus" class="status" style="display:none">天气模型：正在获取…</div><div id="aerosol" class="status" style="display:none">气溶胶：正在获取 Open-Meteo 数据…</div></section><section class="panel"><div class="obs-title">观测地图 <span class="tag2">可拖动观测点 · 海拔分区</span></div><div id="map"></div><div class="legend"><span>● 观测点</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span><span style="color:#d64541">● 云层遮挡视线</span><span style="color:#4a9d78">■ 低海拔 &lt;1500m</span><span style="color:#c98a2b">■ 中海拔 1500–3500m</span><span style="color:#8a6bbd">■ 高海拔 ≥3500m</span></div></section></div>
 <div id="cards" class="cards"></div></div>
 <div id="pane-hist" class="tab-pane"><div class="hist-ctl"><label>起始日期<input type="date" id="hStart"></label><label>结束日期<input type="date" id="hEnd"></label><button class="primary" onclick="queryHistory()">查询回顾</button><button onclick="exportHistory()">导出为 Excel</button><div class="spacer"></div><div class="hint">支持任意历史日期（ERA5 再分析，1940 年至今），单次跨度最多 90 天；近 92 天含气溶胶 AOD 数据，更早则无 AOD（评分自动降级）。导出文件含「每日评分」与「历史 vs 预报趋势对比」两个工作表。</div></div>
@@ -1781,6 +2151,8 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 <div id="histBox" class="panel" style="margin-top:12px"><div class="hist-note">选择日期范围后点击「查询回顾」，这里会展示各座山的每日评分。</div></div></div>
 <div id="pane-kb" class="tab-pane"><div class="rules">{% for t,c,s in rules %}<div class="rule"><b>{{ t }}</b>{{ c }}<small>来源：{{ s }}</small></div>{% endfor %}</div>
 <details class="evidence"><summary>历史成功案例库（{{ success_cases|length }} 例 · 均来自公开报道，可对照学习经验规律）</summary><div class="sample-list">{% for c in success_cases %}<div class="sample"><b>{{ c.date }}</b><div>{{ c.cond }} → {{ c.sight }}</div><span class="tag">{{ c.src }}</span></div>{% endfor %}</div></details></div></div>
+<div id="pane-windy" class="tab-pane"><div class="windy-panel"><div class="panel"><div class="obs-title">Windy 实况地图 <span class="tag2">嵌入式实时气象图层 · 自动跟随当前观测点</span></div><div class="windy-ctl"><button data-windylayer="wind" class="on" onclick="setWindyLayer('wind',this)">风场</button><button data-windylayer="satellite" onclick="setWindyLayer('satellite',this)">卫星云图</button><button data-windylayer="clouds" onclick="setWindyLayer('clouds',this)">云量</button><button data-windylayer="temp" onclick="setWindyLayer('temp',this)">温度</button><button data-windylayer="rain" onclick="setWindyLayer('rain',this)">降水</button><button data-windylayer="rh" onclick="setWindyLayer('rh',this)">湿度</button><button data-windylayer="pressure" onclick="setWindyLayer('pressure',this)">气压</button></div><div id="windyBox" class="windy-box loading"><div class="windy-load">正在加载 Windy 实时地图…</div></div><div class="windy-note">数据由 <b>Windy.com</b> 通过嵌入式 iframe 提供（ECMWF/GFS/ICON 模型叠加实时观测与卫星云图），随你的观测点与所选图层实时更新。卫星云图可直观观察西部雪山区域云况。</div></div></div></div>
+<div id="pane-wm" class="tab-pane"><div class="panel"><div class="obs-title">Windy 数值云图 <span class="tag2">windy.app 云量栅格瓦片 · 直接爬取实时渲染</span></div><div class="wm-ctl"><span class="grp"><b>数据源</b><button data-wm-model="ECMWF" class="on" onclick="setWmModel('ECMWF',this)">ECMWF</button><button data-wm-model="GFS27" onclick="setWmModel('GFS27',this)">GFS27</button><button data-wm-model="ICONGLOBAL" onclick="setWmModel('ICONGLOBAL',this)">ICON13</button></span><span class="grp"><b>云量</b><button data-wm-type="tcdc_total" class="on" onclick="setWmType('tcdc_total',this)">总云量</button><button data-wm-type="tcdc_med" onclick="setWmType('tcdc_med',this)">中云</button><button data-wm-type="tcdc_low" onclick="setWmType('tcdc_low',this)">低云</button><button data-wm-type="tcdc_high" onclick="setWmType('tcdc_high',this)">高云</button></span><span class="grp"><b>实况</b><button data-wm-sat="fy4" onclick="toggleFy4Sat(this)">风云四号红外</button><button data-wm-sat="wxbl" onclick="toggleFy4Sat(this)">真彩色云图</button></span></div><div id="wmStatus" class="wm-status">正在初始化…</div><div id="wmMap" class="wm-map"></div><div class="wm-legend"><span><i style="background:rgba(80,180,255,.85)"></i>云量少</span><span><i style="background:rgba(160,220,240,.9)"></i>云量中等</span><span><i style="background:rgba(255,255,255,.95)"></i>云量大（云层厚）</span></div><div class="wm-note">数据由 <b>windy.app</b> 瓦片服务直接提供（ECMWF/GFS27/ICON13 数值预报模型的云量栅格，无需 API Key）。瓦片随地图缩放实时加载，可拖动查看川西走廊全线云况；点击左上角图层按钮可切换高德底图（标准/卫星）。「<b>风云四号红外</b>」叠加国家卫星气象中心 WMS 红外云图（24 小时可用，白色为云），「<b>真彩色云图</b>」叠加中央气象台风云四号 B 星真彩色（仅白天）。</div></div></div>
 <div id="simModal" class="modal" onclick="if(event.target===this)closeSimulation()"><div class="sim-box"><div class="sim-head"><div><h3 id="simTitle">天空形态模拟</h3><div id="simSub" class="meta"></div></div><button class="sim-close" onclick="closeSimulation()">关闭</button></div><canvas id="simCanvas" class="sim-canvas"></canvas><div id="simMetrics" class="sim-metrics"></div><div id="simNote" class="sim-note"></div></div></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
 const gaodeOpt={subdomains:'1234',maxZoom:18,attribution:'地图 © 高德'};
@@ -1825,7 +2197,7 @@ liveOm.on('dragend',()=>{liveOm.getElement().style.cursor='grab';if(liveOm._wasD
 // 同步主地图观测点标记
 if(window._mainOm)window._mainOm.setLatLng(wgsToGcj(w[0],w[1]));
 // v2.10.3: 实况联动——云图叠加标注 + 未来云量趋势 + 当前实况 + 预报
-syncCloudMapOverlay();loadCurrent();
+syncCloudMapOverlay();loadCurrent();loadFy4Cloud();
 clearTimeout(_dragTimer);_dragTimer=setTimeout(()=>loadAll(),1200)});
 function syncLiveOmFromMain(){if(typeof liveOm!=='undefined'){const g=wgsToGcj(+$('lat').value,+$('lon').value);liveOm.setLatLng(g)}}
 let lastData=null;
@@ -1860,7 +2232,122 @@ d.mountains.forEach(m=>{let mg=wgsToGcj(m.lat,m.lon);bounds.push(mg);layers.push
 $('cards').innerHTML=d.mountains.map((m,mi)=>`<section class="panel mountain"><h3>${m.name}</h3><div class="meta">${m.distance} km · 方位 ${m.bearing}° · 峰顶仰角约 ${m.peak_angle}°</div><div class="days">${m.daily.map((x,di)=>{let b=x.morning;return `<div class="day"><strong>${x.date.slice(5)}</strong><div class="score" style="color:${color(b.score)}">${b.score}</div><div class="bar"><i style="width:${b.score}%"></i></div><div class="tabs"><span>晨 ${fmtTime(b.time)}</span><span>晚 ${x.evening.score}</span></div><div class="metrics"><span>AOD550 <b>${b.aod==null?'暂无':b.aod.toFixed(2)}</b></span><span>低云 <b>${b.low}%</b></span><span>能见 <b>${b.visibility}km</b></span><span>湿度 <b>${b.rh}%</b></span></div><div class="small">金山最高 ${x.gold.gold} 分<br><span class="emp-chip">经验 ${b.empirical_bonus>=0?'+':''}${b.empirical_bonus} · 洗尘+${b.empirical.washout} 霾−${b.empirical.haze} 季${b.empirical.season>=0?'+':''}${b.empirical.season} 窗+${b.empirical.window} 晴+${b.empirical.clear}</span>${synTags(b.synoptic)}${fogTag(b.fog)}<br>${b.reasons.join('、')}</div><div class="sim-actions"><button onclick="openSimulation(${mi},${di},'morning')">晨间形态</button><button onclick="openSimulation(${mi},${di},'evening')">傍晚形态</button></div></div>`}).join('')}</div></section>`).join('')}
 
 // v2.10: 板块整合——天气预报(fc)/实况观测(live)/观山知识(kb)
-function switchTab(t){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='pane-'+t));if(t==='fc'){setTimeout(()=>map.invalidateSize(),60)}else if(t==='hist'){setTimeout(()=>{if(lastData){drawTrend(lastData);drawHistory(lastData)}},60)}else if(t==='live'){setTimeout(()=>{liveMap.invalidateSize();const _g=wgsToGcj(+$('lat').value,+$('lon').value);liveMap.setView(_g,Math.max(liveMap.getZoom(),9));const im=document.querySelector('.sat-wrap img');if(im&&im.complete&&im.naturalWidth)zoomSat(im);const cv=$('satOverlay');if(cv&&cv.width>10)drawCloudOverlay()},60)}}
+function switchTab(t){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='pane-'+t));if(t==='fc'){setTimeout(()=>map.invalidateSize(),60)}else if(t==='hist'){setTimeout(()=>{if(lastData){drawTrend(lastData);drawHistory(lastData)}},60)}else if(t==='live'){setTimeout(()=>{liveMap.invalidateSize();const _g=wgsToGcj(+$('lat').value,+$('lon').value);liveMap.setView(_g,Math.max(liveMap.getZoom(),9));const im=document.querySelector('.sat-wrap img');if(im&&im.complete&&im.naturalWidth)zoomSat(im);const cv=$('satOverlay');if(cv&&cv.width>10)drawCloudOverlay();loadFy4Cloud()},60)}else if(t==='windy'){renderWindy()}else if(t==='wm'){setTimeout(()=>{wmInit()},60)}}
+// v2.10.9: Windy 实况嵌入——按观测点 + 图层生成 iframe
+let _windyLayer='wind';
+const WINDY_ZOOM=7;
+function windyUrl(){
+  const lat=+$('lat').value||30.657,lon=+$('lon').value||104.058;
+  const overlay=_windyLayer;
+  // satellite 层在官方 embed 中自动使用实时卫星云图（东半球 Himawari），无需 product 参数
+  const product=overlay==='satellite'?'':'product=ecmwf';
+  return 'https://embed.windy.com/embed.html?type=map&location=coordinates&metricRain=default&metricTemp=default&metricWind=default&zoom='+WINDY_ZOOM+
+    '&overlay='+overlay+(product?('&'+product):'')+'&level=surface&lat='+lat.toFixed(4)+'&lon='+lon.toFixed(4);
+}
+function renderWindy(){
+  const box=$('windyBox');if(!box)return;
+  box.innerHTML='<div class="windy-load">正在加载 Windy 实时地图…</div>';
+  box.classList.add('loading');
+  const f=document.createElement('iframe');
+  f.src=windyUrl();f.loading='lazy';f.allowFullscreen=true;
+  f.onload=()=>box.classList.remove('loading');
+  box.appendChild(f);
+}
+function setWindyLayer(layer,btn){
+  _windyLayer=layer;
+  document.querySelectorAll('.windy-ctl button').forEach(b=>b.classList.toggle('on',b===btn));
+  renderWindy();
+}
+// v2.10.10: Windy.app 数值云图瓦片——数据源/云量类型切换（直接爬取瓦片渲染，无需 API Key）
+let _wmModel='ECMWF',_wmType='tcdc_total',_wmMap=null,_wmTile=null;
+const WM_MODEL_MAXZ={ECMWF:7,GFS27:5,ICONGLOBAL:7};
+function wmTs(){
+  const now=Math.floor(Date.now()/1000);
+  return Math.floor(now/3600)*3600;   // 当前 UTC 整点帧
+}
+function wmUrl(){
+  const ts=wmTs();
+  return `https://tiles-web.windyapp.co/v10/tiles/${_wmModel}/${_wmType}/${ts}/{z}/{x}/{y}`;
+}
+function wmInit(){
+  if(_wmMap){_wmMap.invalidateSize();return}
+  const el=$('wmMap');if(!el)return;
+  _wmMap=L.map('wmMap',{layers:[gaodeRoad]}).setView([+$('lat').value||30.657,+$('lon').value||104.058],6);
+  _wmMap.createPane('wmPane');_wmMap.getPane('wmPane').style.zIndex=400;
+  _wmTile=L.tileLayer(wmUrl(),{pane:'wmPane',tms:false,opacity:.92,maxZoom:WM_MODEL_MAXZ[_wmModel],maxNativeZoom:7}).addTo(_wmMap);
+  L.control.layers({'高德标准地图':gaodeRoad,'高德卫星影像':gaodeSatellite},null,{position:'topright',collapsed:true}).addTo(_wmMap);
+  _wmMap.on('zoomend',()=>setWmStatus());
+  setWmStatus('已加载 · '+fmtWmTime(wmTs()));
+}
+function fmtWmTime(ts){
+  const d=new Date(ts*1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')} ${String(d.getUTCHours()).padStart(2,'0')}:00 UTC（北京时间 ${String((d.getUTCHours()+8)%24).padStart(2,'0')}:00）`;
+}
+function setWmStatus(extra){
+  const s=$('wmStatus');if(!s)return;
+  const mz=_wmMap?_wmMap.getZoom():6;
+  s.textContent=`数据源 ${_wmModel} · ${_wmType==='tcdc_total'?'总云量':_wmType==='tcdc_med'?'中云':_wmType==='tcdc_low'?'低云':'高云'} · 缩放级别 ${mz} · 当前帧 ${fmtWmTime(wmTs())}${extra?(' · '+extra):''}`;
+}
+function setWmModel(model,btn){
+  if(_wmModel===model)return;
+  _wmModel=model;
+  document.querySelectorAll('.wm-ctl [data-wm-model]').forEach(b=>b.classList.toggle('on',b.dataset.wmModel===model));
+  applyWm();
+}
+function setWmType(type,btn){
+  if(_wmType===type)return;
+  _wmType=type;
+  document.querySelectorAll('.wm-ctl [data-wm-type]').forEach(b=>b.classList.toggle('on',b.dataset.wmType===type));
+  applyWm();
+}
+function applyWm(){
+  if(!_wmMap){wmInit();return}
+  if(_wmTile){_wmMap.removeLayer(_wmTile)}
+  _wmTile=L.tileLayer(wmUrl(),{pane:'wmPane',tms:false,opacity:.92,maxZoom:WM_MODEL_MAXZ[_wmModel],maxNativeZoom:7}).addTo(_wmMap);
+  // GFS27 分辨率低，若当前缩放超过模型上限则自动缩回可显示级别
+  const maxz=WM_MODEL_MAXZ[_wmModel];
+  if(_wmMap.getZoom()>maxz){_wmMap.setZoom(maxz,{animate:true})}
+  setWmStatus('已切换');
+}
+// v2.10.10: 标签页切换时若 Windy 云图已初始化过则保持状态
+function wmRefresh(){if(_wmMap)applyWm()}
+// v2.10.12: 风云四号实况云图叠加（红外 WMS 裁剪图 / 真彩色云图）
+let _wmSat=null,_wmSatLayer=null;
+function toggleFy4Sat(btn){
+  if(!_wmMap){wmInit()}
+  const mode=btn.dataset.wmSat;
+  document.querySelectorAll('.wm-ctl [data-wm-sat]').forEach(b=>b.classList.toggle('on',b===btn&&_wmSat!==mode||(b===btn&&_wmSat===null)));
+  if(_wmSat===mode){_wmSat=null;if(_wmSatLayer){_wmMap.removeLayer(_wmSatLayer);_wmSatLayer=null}setWmStatus('已取消实况叠加');return}
+  _wmSat=mode;
+  if(mode==='fy4'){loadFy4Irx(btn)}else{loadWxblSat(btn)}
+}
+function loadFy4Irx(btn){
+  setWmStatus('正在加载风云四号红外云图…');
+  fetch('/api/fy4-irx/info').then(r=>r.json()).then(j=>{
+    if(!j.ok)throw Error(j.error||'加载失败');
+    const d=j.data,b=d.bbox;
+    const img=L.imageOverlay('/api/fy4-irx',[[b[0],b[1]],[b[2],b[3]]],{opacity:.85,pane:'wmPane',interactive:false});
+    if(_wmSatLayer)_wmMap.removeLayer(_wmSatLayer);
+    _wmSatLayer=img.addTo(_wmMap);
+    const t=new Date(d.time_bj);
+    setWmStatus('风云四号红外云图 · 时次 '+t.toLocaleString('zh-CN',{hour12:false})+' · 白色为云');
+    if(_wmMap.getZoom()<6)_wmMap.setZoom(6,{animate:true});
+  }).catch(err=>{setWmStatus('风云四号红外加载失败: '+err.message);_wmSat=null;if(btn)btn.classList.remove('on')});
+}
+function loadWxblSat(btn){
+  setWmStatus('正在加载风云四号真彩色云图…');
+  fetch('/api/sat').then(r=>{if(!r.ok)throw Error('云图暂不可用（可能为夜间）');return r.json()}).then(j=>{
+    if(!j.ok)throw Error(j.error||'加载失败');
+    const d=j.data;
+    // 中央气象台 ACHN 等距投影全国图（西起 65E 东至 145E，南 10N 北 60N）
+    const bounds=[[10,65],[60,145]];
+    const img=L.imageOverlay(d.url,bounds,{opacity:.85,pane:'wmPane',interactive:false});
+    if(_wmSatLayer)_wmMap.removeLayer(_wmSatLayer);
+    _wmSatLayer=img.addTo(_wmMap);
+    setWmStatus('风云四号真彩色云图 · 时次 '+new Date(d.time).toLocaleString('zh-CN',{hour12:false}));
+    if(_wmMap.getZoom()<6)_wmMap.setZoom(6,{animate:true});
+  }).catch(err=>{setWmStatus('真彩色云图加载失败: '+err.message);_wmSat=null;if(btn)btn.classList.remove('on')});
+}
 // v2.5: 预报附带的历史（过去7天，随预报数据返回）
 function drawHistory(d){
   const box=$('histBox');if(!box)return;
@@ -1963,7 +2450,73 @@ function loadObs(){
     if(d.sat_note)html+='<div class="obs-note">'+d.sat_note+'</div>';
     box.innerHTML=html;
     loadCloudTrend();
+    loadFy4Cloud();
   }).catch(()=>{box.style.display='none'});
+}
+// v2.10.13: 风云四号实况云况分析（红外云检测统计 + 云顶高度分层）
+function loadFy4Cloud(){
+  const box=$('fy4CloudBox');if(!box)return;
+  const lat=+$('lat').value,lon=+$('lon').value;
+  fetch('/api/fy4-cloud?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+    if(!j.ok||!j.data)throw Error((j.error||'暂无数据'));
+    box.innerHTML=renderFy4Cloud(j.data);
+    loadFy4Gibs();
+  }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">云况分析加载失败：'+e.message+'</div>'});
+}
+// v2.10.14: NASA GIBS 卫星云顶高度（Himawari 红外分级 + MODIS CTH 定量）
+function loadFy4Gibs(){
+  const box=$('fy4CloudBox');if(!box)return;
+  const lat=+$('lat').value,lon=+$('lon').value;
+  fetch('/api/fy4-cloud/gibs?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+    if(!j.ok||!j.data)throw Error((j.error||'暂无数据'));
+    box.insertAdjacentHTML('beforeend',renderFy4Gibs(j.data));
+  }).catch(e=>{box.insertAdjacentHTML('beforeend','<div class="hist-note" style="color:var(--muted);margin-top:10px">卫星云顶高度加载失败：'+e.message+'</div>')});
+}
+function renderFy4Gibs(d){
+  const ir=d.ir13,ct=d.cth;
+  let html='<div class="obs-title" style="margin-top:16px">卫星云顶高度 <span class="tag2">NASA GIBS · Himawari 红外 + MODIS 定量（免登录）</span></div>';
+  if(ir){
+    const bar=(v,color,label)=>`<div style="flex:1;min-width:64px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">${label}</div><div style="height:9px;border-radius:5px;background:#edf2f6;overflow:hidden"><div style="height:100%;width:${v}%;background:${color};border-radius:5px"></div></div><div style="font-size:12px;margin-top:3px"><b>${v}%</b></div></div>`;
+    html+=`<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">${bar(ir.high_rate,'#8a6bbd','高云 ≥7km')}${bar(ir.mid_rate,'#5fa8ad','中云 3-7km')}${bar(ir.low_rate,'#7fa3b8','低云/晴 <3km')}</div>`;
+    html+=`<div class="obs-note" style="margin-top:8px">${ir.note}（平均亮温 ${ir.mean_tbb}℃）</div>`;
+  }
+  if(ct){
+    html+=`<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">`;
+    html+=`<div style="background:var(--soft);border-radius:8px;padding:8px 12px;font-size:12px"><div style="color:var(--muted);font-size:11px">云顶最高</div><b style="font-size:16px;color:var(--accent)">${ct.max} km</b></div>`;
+    html+=`<div style="background:var(--soft);border-radius:8px;padding:8px 12px;font-size:12px"><div style="color:var(--muted);font-size:11px">平均</div><b style="font-size:16px">${ct.mean} km</b></div>`;
+    html+=`<div style="background:var(--soft);border-radius:8px;padding:8px 12px;font-size:12px"><div style="color:var(--muted);font-size:11px">中位</div><b style="font-size:16px">${ct.median} km</b></div>`;
+    html+=`<div style="background:var(--soft);border-radius:8px;padding:8px 12px;font-size:12px"><div style="color:var(--muted);font-size:11px">有效像元</div><b style="font-size:16px">${ct.total}</b></div></div>`;
+    html+=`<div style="display:flex;height:14px;border-radius:7px;overflow:hidden;margin-top:8px;background:#edf2f6">`;
+    html+=`<div style="width:${ct.low_rate}%;background:#7fa3b8" title="低云顶<3km"></div><div style="width:${ct.mid_rate}%;background:#5fa8ad" title="中云顶3-7km"></div><div style="width:${ct.high_rate}%;background:#8a6bbd" title="高云顶≥7km"></div></div>`;
+    html+=`<div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px;color:var(--muted)"><span>低&lt;3km ${ct.low_rate}%</span><span>中3-7km ${ct.mid_rate}%</span><span>高≥7km ${ct.high_rate}%</span><span>${ct.source} 过境</span></div>`;
+    html+=`<div class="obs-note" style="margin-top:8px">${ct.note}</div>`;
+  }
+  if(!ir&&!ct)html+='<div class="hist-note" style="color:var(--muted)">暂无卫星云顶高度数据</div>';
+  return html;
+}
+function renderFy4Cloud(d){
+  const c=d.center,s=d.stats,t=d.top;
+  const time=new Date(d.time_bj);
+  const cBg=c.cloud?'linear-gradient(135deg,#5b7d94,#3d5c72)':'linear-gradient(135deg,#e8f4ee,#cfe8dc)';
+  const cTxt=c.cloud?'#fff':'#2e6b4f';
+  const cTag=c.cloud?'有云':'晴空';
+  let topHtml='';
+  if(t&&(t.low!=null||t.mid!=null||t.high!=null)){
+    const bar=(v,color,label)=>{const p=v==null?0:v;return `<div style="flex:1;min-width:70px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">${label}</div><div style="height:9px;border-radius:5px;background:#edf2f6;overflow:hidden"><div style="height:100%;width:${p}%;background:${color};border-radius:5px"></div></div><div style="font-size:12px;margin-top:3px"><b>${v==null?'—':p+'%'}</b></div></div>`};
+    topHtml=`<div class="obs-title" style="margin-top:12px">云顶高度分层 <span class="tag2">Open-Meteo 数值模式 · 低/中/高云量（近似）</span></div><div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px">${bar(t.low,'#7fa3b8','低云 &lt;2km')}${bar(t.mid,'#5fa8ad','中云 2–6km')}${bar(t.high,'#4c9a6c','高云 &gt;6km')}</div>`;
+  }
+  const rows=[
+    ['定位','<b>'+c.lat.toFixed(2)+'°N, '+c.lon.toFixed(2)+'°E</b>（卫星 4km 网格 '+c.row+','+c.col+'）'],
+    ['中心像元','<span style="color:'+(c.cloud?'#c25548':'#3e8e6e')+';font-weight:700">'+cTag+'</span>（风云四号红外云检测）'],
+    ['有云像元','<b style="color:#c25548">'+s.cloudy+' / '+s.total+'</b>（'+s.cloudy_rate+'%）'],
+    ['晴空像元','<b style="color:#3e8e6e">'+s.clear+' / '+s.total+'</b>（'+s.clear_rate+'%）'],
+    ['云区比例','<b>'+s.cloud_ratio+'%</b> · 晴空比例 <b>'+s.clear_ratio+'%</b>'],
+  ];
+  let html=`<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px"><div style="min-width:96px;padding:14px 10px;border-radius:12px;background:${cBg};color:${cTxt};text-align:center"><div style="font-size:11px;opacity:.85">中心像元</div><div style="font-size:20px;font-weight:800;letter-spacing:1px">${cTag}</div><div style="font-size:10.5px;opacity:.8;margin-top:2px">${time.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</div></div><div style="flex:1;min-width:220px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">周围 ${s.total} 像元云况（约 90km 范围）</div><div style="display:flex;height:14px;border-radius:7px;overflow:hidden;background:#edf2f6"><div style="width:${s.cloudy_rate}%;background:#8fa8ba"></div><div style="width:${s.clear_rate}%;background:#7fbf9e"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#8fa8ba;vertical-align:middle;margin-right:3px"></i>云 ${s.cloudy_rate}%</span><span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:#7fbf9e;vertical-align:middle;margin-right:3px"></i>晴 ${s.clear_rate}%</span><span style="color:var(--muted)">有效率 ${s.valid_rate}%</span></div></div></div>`;
+  html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
+  html+=topHtml;
+  html+=`<div class="obs-note" style="margin-top:10px">${d.note}</div>`;
+  return html;
 }
 // v2.9.8: 西南区域裁剪放大（CSS 定位+缩放，避免跨域图片污染 canvas）
 function zoomSat(img){

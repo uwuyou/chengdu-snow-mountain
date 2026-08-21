@@ -5,3 +5,20 @@ venv/
 .env
 .DS_Store
 *.log
+
+# 运行时临时文件（不要进仓库）
+.uploads/
+current_url.txt
+*.zip
+windy_screenshots/
+*.png
+*.jpg
+*.jpeg
+own_tunnel_localhostrun.sh
+
+# 本沙箱专用的隧道/运维脚本（云端部署不需要）
+tunnel_localhostrun.sh
+keep_alive.sh
+restart_services.sh
+supervisor/
+windyapp_网络请求探测报告.md
