@@ -20,7 +20,21 @@ python chengdu_snow_mountain.py
 
 ## 部署
 
-### Render（免费）
+### Hugging Face Spaces（免费 · 无需绑卡）
+
+1. 注册 [huggingface.co](https://huggingface.co)（邮箱即可，**不要求信用卡**）
+2. 右上角头像 → **New Space**，配置：
+   - Space name：`chengdu-snow-mountain`
+   - License：随意（如 MIT）
+   - **SDK 选择 Docker**（关键，不要选 Gradio/Streamlit）
+   - Hardware：CPU basic（免费 2 vCPU / 16GB）
+   - Visibility：Public
+3. 创建后按页面提示连接仓库：**git push 到该 Space**（或网页直接上传文件）
+4. 等待 2-5 分钟构建，访问 `https://你的用户名-chengdu-snow-mountain.hf.space`
+
+应用通过 `PORT` 环境变量自动适配 Space 的 7860 端口，无需改代码。免费额度闲置 48 小时后休眠，下次访问自动唤醒。
+
+### Render（免费额度，可能需要手机验证）
 
 1. 将本仓库导入 Render（New + → Web Service → 连接 GitHub 仓库）
 2. 配置：
