@@ -746,6 +746,88 @@ def fy4_irx_png(now=None):
         return None
 
 
+# ---- v2.10.15: 风云四号红外云图多时次动画（复用 GEOS_IRX WMS，近 2 小时 8 帧合成 GIF） ----
+FY4_ANIM_FRAMES = 8          # 动画帧数（近 8 个时次，约 2 小时）
+FY4_ANIM_DUR_MS = 700        # 每帧显示时长(ms)
+FY4_ANIM_OUT_W = 900         # 输出宽度（与单帧一致）
+
+def fy4_irx_anim(now=None):
+    """拉取最近 N 个时次的风云四号红外云图，逐帧裁剪川西区域并合成 GIF 动画。
+    返回 {"gif": 字节, "info": {times, bbox, width, height, frames}} 或 None。缓存 10 分钟。
+    若可用的历史帧 < 3 帧则返回 None（数据不足）。NSMC 偶发 TLS 断连时自动重试一次。"""
+    cached = cache_get("obs:fy4anm", 600)
+    if cached is not None: return cached
+    for attempt in (1, 2):
+        try:
+            out = _fy4_irx_anim_impl(now)
+            if out is not None:
+                cache_put("obs:fy4anm", out)
+                return out
+            break  # 明确无数据，无需重试
+        except Exception as e:
+            print(f"[fy4_irx_anim] 第{attempt}次失败 {type(e).__name__}: {e}", flush=True)
+            if attempt == 1:
+                time.sleep(1.5)
+                continue
+    return None
+
+
+def _fy4_irx_anim_impl(now):
+    """动画实际实现（供重试包装调用），抛异常表示可重试的传输错误。"""
+    from PIL import Image
+    import io as _io
+    now = now or datetime.now(TZ)
+    # 1) 查询时次列表（与单帧同一接口，hourRange=24）
+    r = SESSION.get(FY4_WMS_TIME_URL, timeout=20)
+    r.raise_for_status()
+    ds = r.json().get("ds") or []
+    if len(ds) < 3:
+        return None
+    times = [d["dataDate"] + (d["dataTime"] or "")[:4] for d in ds[-FY4_ANIM_FRAMES:]]
+    # 2) 逐帧拉取并裁剪
+    lon0, lon1 = float(FY4_WMS_BBOX.split(",")[0]), float(FY4_WMS_BBOX.split(",")[2])
+    lat1, lat0 = float(FY4_WMS_BBOX.split(",")[3]), float(FY4_WMS_BBOX.split(",")[1])
+    c = FY4_CROP
+    px0 = int((c["lon0"] - lon0) / (lon1 - lon0) * FY4_WMS_W)
+    px1 = int((c["lon1"] - lon0) / (lon1 - lon0) * FY4_WMS_W)
+    py0 = int((lat1 - c["lat1"]) / (lat1 - lat0) * FY4_WMS_H)
+    py1 = int((lat1 - c["lat0"]) / (lat1 - lat0) * FY4_WMS_H)
+    oh = int(FY4_ANIM_OUT_W * (py1 - py0) / (px1 - px0))
+    frames, ok_times = [], []
+    for dt in times:
+        try:
+            r2 = SESSION.get(FY4_WMS_BASE, params={
+                "layers": "GEOS_IRX", "datetime": dt, "request": "GetMap",
+                "bbox": FY4_WMS_BBOX, "width": FY4_WMS_W, "height": FY4_WMS_H,
+                "version": "1.1.0", "format": "png",
+            }, timeout=30)
+            r2.raise_for_status()
+            if not r2.content or len(r2.content) < 2000:
+                continue  # 该时次空白，跳过
+            img = Image.open(_io.BytesIO(r2.content)).convert("RGBA")
+            crop = img.crop((px0, py0, px1, py1))
+            frames.append(crop.resize((FY4_ANIM_OUT_W, oh), Image.LANCZOS))
+            ok_times.append(dt)
+        except Exception:
+            continue
+    if len(frames) < 3:
+        return None  # 有效帧不足
+    # 3) 合成 GIF（循环播放，帧间隔 FY4_ANIM_DUR_MS）
+    buf = _io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:],
+                   duration=FY4_ANIM_DUR_MS, loop=0, disposal=2, optimize=False)
+    # 4) 时次标注（北京时间）
+    bj_times = []
+    for dt in ok_times:
+        t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        bj_times.append(t_utc.astimezone(TZ).strftime("%m-%d %H:%M"))
+    return {"gif": buf.getvalue(),
+            "info": {"times": bj_times, "frames": len(ok_times),
+                     "bbox": [c["lat0"], c["lon0"], c["lat1"], c["lon1"]],
+                     "width": FY4_ANIM_OUT_W, "height": oh,
+                     "interval_min": 15}}
+
+
 # ---- v2.10.13: 风云四号实况云况分析（近似云掩膜 CLM + 云顶高度分层） ----
 # 云掩膜：NSMC WMS GEOS_IRX 二值云检测图（白=云、黑=晴，已用 18 个机场 METAR 交叉验证）。
 # 云顶分层：Open-Meteo 数值模式低/中/高云量近似（无 API Key 的替代方案）。
@@ -1982,6 +2064,21 @@ def api_fy4_irx_info():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
 
 
+@APP.get("/api/fy4-irx/anim")
+def api_fy4_irx_anim():
+    """v2.10.15 风云四号红外云图多时次动画 GIF（近 2 小时 8 帧，川西区域裁剪）。"""
+    try:
+        data = fy4_irx_anim()
+        if not data:
+            return jsonify({"ok": False, "error": "风云四号云图动画暂不可用（历史帧不足或数据源无响应）"}), 502
+        resp = send_file(io.BytesIO(data["gif"]), mimetype="image/gif",
+                         download_name="fy4_irx_anim.gif", max_age=0)
+        resp.headers["X-Fy4-Anim-Frames"] = str(data["info"]["frames"])
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
 @APP.get("/api/fy4-cloud")
 def api_fy4_cloud():
     """v2.10.13 风云四号实况云况分析：中心像元 + 周围 81 像元云掩膜统计 + 云顶高度分层。"""
@@ -2312,12 +2409,12 @@ function applyWm(){
 // v2.10.10: 标签页切换时若 Windy 云图已初始化过则保持状态
 function wmRefresh(){if(_wmMap)applyWm()}
 // v2.10.12: 风云四号实况云图叠加（红外 WMS 裁剪图 / 真彩色云图）
-let _wmSat=null,_wmSatLayer=null;
+let _wmSat=null,_wmSatLayer=null,_wmAnimUrl=null;
 function toggleFy4Sat(btn){
   if(!_wmMap){wmInit()}
   const mode=btn.dataset.wmSat;
   document.querySelectorAll('.wm-ctl [data-wm-sat]').forEach(b=>b.classList.toggle('on',b===btn&&_wmSat!==mode||(b===btn&&_wmSat===null)));
-  if(_wmSat===mode){_wmSat=null;if(_wmSatLayer){_wmMap.removeLayer(_wmSatLayer);_wmSatLayer=null}setWmStatus('已取消实况叠加');return}
+  if(_wmSat===mode){_wmSat=null;if(_wmSatLayer){_wmMap.removeLayer(_wmSatLayer);_wmSatLayer=null}if(_wmAnimUrl){URL.revokeObjectURL(_wmAnimUrl);_wmAnimUrl=null}setWmStatus('已取消实况叠加');return}
   _wmSat=mode;
   if(mode==='fy4'){loadFy4Irx(btn)}else{loadWxblSat(btn)}
 }
@@ -2326,12 +2423,24 @@ function loadFy4Irx(btn){
   fetch('/api/fy4-irx/info').then(r=>r.json()).then(j=>{
     if(!j.ok)throw Error(j.error||'加载失败');
     const d=j.data,b=d.bbox;
-    const img=L.imageOverlay('/api/fy4-irx',[[b[0],b[1]],[b[2],b[3]]],{opacity:.85,pane:'wmPane',interactive:false});
-    if(_wmSatLayer)_wmMap.removeLayer(_wmSatLayer);
-    _wmSatLayer=img.addTo(_wmMap);
-    const t=new Date(d.time_bj);
-    setWmStatus('风云四号红外云图 · 时次 '+t.toLocaleString('zh-CN',{hour12:false})+' · 白色为云');
-    if(_wmMap.getZoom()<6)_wmMap.setZoom(6,{animate:true});
+    const bounds=[[b[0],b[1]],[b[2],b[3]]];
+    const apply=(url,label)=>{
+      if(_wmSatLayer)_wmMap.removeLayer(_wmSatLayer);
+      _wmSatLayer=L.imageOverlay(url,bounds,{opacity:.85,pane:'wmPane',interactive:false}).addTo(_wmMap);
+      setWmStatus(label);
+      if(_wmMap.getZoom()<6)_wmMap.setZoom(6,{animate:true});
+    };
+    // v2.10.15: 优先加载多时次动画 GIF，失败则回退单帧
+    fetch('/api/fy4-irx/anim',{cache:'no-store'}).then(r=>{
+      if(!r.ok)throw Error('动画不可用');
+      return r.blob();
+    }).then(blob=>{
+      const url=URL.createObjectURL(blob);
+      apply(url,'风云四号红外云图动画 · 近 8 时次 · 白色为云（15 分钟/帧，循环播放）');
+      _wmAnimUrl=url;
+    }).catch(()=>{
+      apply('/api/fy4-irx','风云四号红外云图 · 时次 '+(new Date(d.time_bj).toLocaleString('zh-CN',{hour12:false}))+' · 白色为云');
+    });
   }).catch(err=>{setWmStatus('风云四号红外加载失败: '+err.message);_wmSat=null;if(btn)btn.classList.remove('on')});
 }
 function loadWxblSat(btn){
