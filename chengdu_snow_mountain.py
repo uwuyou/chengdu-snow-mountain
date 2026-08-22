@@ -4541,8 +4541,10 @@ if(_forecastBusy&&!force)return;
 if(!force&&key===_lastReqKey){return}
 _lastReqKey=key;_forecastBusy=true;
 const id=++forecastRequest;localStorage.setItem('snowWeatherModel',chosen);document.body.classList.add('loading');$('modelStatus').textContent='天气模型：正在获取 '+$('model').selectedOptions[0].text+'…';$('aerosol').textContent='气溶胶：正在获取 Open-Meteo AOD550…';let q=new URLSearchParams(obs());try{
-// v2.4: fetch 加 60s 超时，防止网关/代理挂起后返回 HTML 错误页
-const ac=new AbortController(),to=setTimeout(()=>ac.abort(),60000);let r;try{r=await fetch('/api/forecast?'+q,{signal:ac.signal})}finally{clearTimeout(to)}
+// v2.4: fetch 加 300s 超时，防止网关/代理挂起后返回 HTML 错误页；
+// v3.x: 该值需大于后端冷取耗时（GFS 下载 + ADS 同步检索可达 2~5 分钟），
+// 否则冷启动时前端 60s 内收不到响应即 abort，导致预报卡片永不渲染。
+const ac=new AbortController(),to=setTimeout(()=>ac.abort(),300000);let r;try{r=await fetch('/api/forecast?'+q,{signal:ac.signal})}finally{clearTimeout(to)}
 // v2.4: 校验响应类型——网关/代理超时或 404 时可能返回 HTML 而非 JSON
 const ct=r.headers.get('content-type')||'';if(!ct.includes('application/json'))throw Error(r.status===504?'数据源响应超时(504)，请稍后刷新':'数据源返回异常页面('+r.status+')，可能为网关超时，请稍后刷新');
 let j;try{j=await r.json()}catch(e){throw Error('数据源返回格式异常（非JSON），请稍后刷新')}
