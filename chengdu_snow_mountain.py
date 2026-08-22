@@ -3073,7 +3073,7 @@ function renderFireCloud(d){
     ['黄金窗口',d.window?'<b style="color:#e05a2b">处于日出/日落 ±10° 窗口</b>':'当前不在日出/日落窗口'],
   ];
   html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
-  if(litNote)html+=`<div class="hist-note" style="margin-top:10px;color:#b07a2a">💡 ${litNote}</div>`;
+  if(litNote)html+=`<div class="hist-note" style="margin-top:10px;color:#b07a2a">💡 ${litNote}。<br>点击下方「定位到火烧云范围」将跳转到太阳方向扇区查看（黄色楔形范围）。</div>`;
   html+='<div class="obs-note" style="margin-top:10px">'+d.note+'</div>';
   html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px">定位到火烧云范围</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变=中高云分布范围</span></div>`;
   return html;
@@ -3134,11 +3134,34 @@ function drawFireCloudMap(d,fast){
   _fcLayer=grp.addTo(map);
 }
 function fitFireCloud(){
-  if(!_fcData||!_fcData.cells||!_fcData.cells.length)return;
+  // v2.10.23: 修复"点击没反应"——无受光云(cells为空)时不再静默return，
+  // 改为定位到太阳扇区并给出提示；单点云区时用扇区端点兜底防 fitBounds 退化。
+  if(!_fcData)return;
+  const lat=+$('lat').value,lon=+$('lon').value;
+  const az=_fcData.sun.az,hw=_fcData.sector.half_width;
+  const cells=_fcData.cells||[];
+  // 太阳扇区兜底边界（观测点 + 太阳方位 ±70° 方向 900km 圆弧端点）
+  const pts=[[lat,lon]];
+  for(let k=0;k<=60;k++){const a=az-hw+(2*hw)*k/60;const p=destPtWgs(lat,lon,900,a);pts.push(p)}
   let minLat=90,maxLat=-90,minLon=181,maxLon=-181;
-  _fcData.cells.forEach(c=>{if(c.lat<minLat)minLat=c.lat;if(c.lat>maxLat)maxLat=c.lat;if(c.lon<minLon)minLon=c.lon;if(c.lon>maxLon)maxLon=c.lon});
+  const acc=p=>{if(p[0]<minLat)minLat=p[0];if(p[0]>maxLat)maxLat=p[0];if(p[1]<minLon)minLon=p[1];if(p[1]>maxLon)maxLon=p[1]};
+  pts.forEach(acc);
+  if(cells.length){cells.forEach(c=>acc([c.lat,c.lon]))}
   const b=[[maxLat,minLon],[minLat,maxLon]].map(ll=>wgsToGcj(ll[0],ll[1]));
-  switchTab('live');setTimeout(()=>liveMap.fitBounds(b,{padding:[24,24],maxZoom:7}),80);
+  switchTab('live');
+  setTimeout(()=>{
+    liveMap.fitBounds(b,{padding:[24,24],maxZoom:7});
+    // 无受光云时给出定位反馈
+    if(!cells.length){
+      const boxEl=$('fireCloudBox');if(!boxEl||boxEl.querySelector('.fc-fit-tip'))return;
+      const tip=document.createElement('div');
+      tip.className='fc-fit-tip';
+      tip.style.cssText='margin-top:8px;padding:7px 10px;border-radius:8px;background:#fdf3e3;color:#a06a1f;font-size:11.5px;border:1px solid #ecd9a8';
+      tip.innerHTML='📍 当前无『云底受光』中高云（受光率 0%），已定位到太阳方向扇区（黄色楔形范围）。'
+        +(_fcData.sun.elev>10?'太阳高度角 '+_fcData.sun.elev+'° 过高，阳光无法从地平线方向射入云底下方，不会形成火烧云。':'');
+      boxEl.appendChild(tip);
+    }
+  },120);
 }
 // v2.9.8: 西南区域裁剪放大（CSS 定位+缩放，避免跨域图片污染 canvas）
 function zoomSat(img){
