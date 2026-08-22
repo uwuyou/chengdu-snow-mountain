@@ -970,12 +970,45 @@ def _azimuth_diff(a, b):
     d = abs(a - b) % 360
     return d if d <= 180 else 360 - d
 
-def _fire_cloud_score(elev, az, sector_cloud_rate, sector_mh_rate, avg_g):
-    """双源共用的火烧云评分。返回 (score, level, is_window, phase)。"""
-    if 15 <= sector_mh_rate <= 75:
-        s_cover = 100 - abs(sector_mh_rate - 40) * 1.2   # 40% 附近最优
+# ---- v2.10.20: 火烧云"云底受光"几何判断 ----
+# 依据《火烧云定量预报速成(长三角适用)》第 1.2 节几何模型：
+#   坐标系：观测者为原点，x=水平球面距离(km)，h=海拔高度(km)，R=地球半径。
+#   视线高度公式   h(x) = θ·x + x²/(2R)     （θ=视线仰角(弧度)，第一项为仰角上升，第二项为地球曲率修正）
+#   由上式反推云边界(云底)高度角：θ_edge = h_base/x - x/(2R)
+#   判断(图1.5/预报流程第3步)：只有太阳光线高度角 θ_sun 满足
+#       -x/(2R) < θ_sun < θ_edge
+#   时，阳光才能从云边界下方的空隙穿过、照射到云层下方照亮云底 → 真火烧云；
+#   否则云底在阴影中（光线高于云底=照云顶，低于地表=被地球遮挡）。
+FIRE_R = 6371.0                # 地球半径 km（与 PDF 一致）
+FIRE_CLOUD_THICK_KM = 1.5      # 中高云平均厚度估计（云顶→云底，卫星只见云顶）
+
+def _cloud_top_km_fy4(g):
+    """风云四号红外灰度 → 云顶高度(km)。灰度≈亮温(越高越冷)，标准大气递减率反推。"""
+    t = -32.0 - (g - 160.0) / 95.0 * 53.0     # g=160→-32℃, g=255→-85℃
+    return max(1.5, (15.0 - t) / 6.5)         # 地面15℃, 6.5℃/km
+
+def _cloud_top_km_kma(iv):
+    """KMA ircimss2 色标索引 → 云顶高度(km)。索引≥176 对应亮温≤-30℃。"""
+    t = -30.0 - (iv - 176.0) / 79.0 * 55.0    # iv=176→-30℃, iv=255→-85℃
+    return max(1.5, (15.0 - t) / 6.5)
+
+def _cloud_base_lit(sun_elev_deg, dist_km, h_top_km):
+    """PDF 几何模型：给定太阳高度角、云距离、云顶高度，判断云底能否被低角度阳光照亮。
+    返回 (受光bool, 云底高度km, 云边界高度角°)。"""
+    if dist_km <= 0:
+        return False, 0.0, 0.0
+    h_base = max(0.5, h_top_km - FIRE_CLOUD_THICK_KM)
+    theta_sun = math.radians(sun_elev_deg)
+    theta_edge = h_base / dist_km - dist_km / (2.0 * FIRE_R)
+    lit = theta_edge > theta_sun > -dist_km / (2.0 * FIRE_R)
+    return lit, h_base, math.degrees(theta_edge)
+
+def _fire_cloud_score(elev, az, sector_cloud_rate, sector_lit_rate, avg_g):
+    """双源共用的火烧云评分（基于"云底受光"中高云占比）。返回 (score, level, is_window, phase)。"""
+    if 15 <= sector_lit_rate <= 75:
+        s_cover = 100 - abs(sector_lit_rate - 40) * 1.2   # 40% 附近最优
     else:
-        s_cover = max(0, 100 - abs(sector_mh_rate - 40) * 2.5)
+        s_cover = max(0, 100 - abs(sector_lit_rate - 40) * 2.5)
     if avg_g:
         s_cold = min(100, (avg_g - 150) * 1.8)
     else:
@@ -1037,7 +1070,8 @@ def _slider_full_png(ts, z=1):
     return full
 
 def _fire_cloud_analyze_kma(lat, lon, elev, az):
-    """GK2A 太阳扇区中高云分析。返回 (cloud_rate, mh_rate, avg_g, cells) 或 None。"""
+    """GK2A 太阳扇区中高云分析（含"云底受光"几何过滤）。
+    返回 (cloud_rate, mh_rate, lit_rate, avg_g, cells, ts) 或 None。"""
     SECTOR, MAX_DIST = 70.0, 1500.0
     ts = _slider_latest_ts()
     full = _slider_full_png(ts)
@@ -1050,7 +1084,7 @@ def _fire_cloud_analyze_kma(lat, lon, elev, az):
     sy_r = SLIDER_CFG["disk_radius_y_z0"] * 2**SLIDER_CFG["z_max"] / scale
     max_x, max_y = SLIDER_CFG["max_rad_x"], SLIDER_CFG["max_rad_y"]
     CELL = 2
-    n_tot = n_cld = n_mh = 0
+    n_tot = n_cld = n_mh = n_lit = 0
     mid_high = []
     ys, xs = np.mgrid[CELL//2:Hh:CELL, CELL//2:Ww:CELL]
     for yy, xx in zip(ys.ravel(), xs.ravel()):
@@ -1069,17 +1103,21 @@ def _fire_cloud_analyze_kma(lat, lon, elev, az):
         if iv >= 128: n_cld += 1
         if iv >= 176:
             n_mh += 1
-            mid_high.append((plon, plat, iv))
+            lit, _, _ = _cloud_base_lit(elev, dist, _cloud_top_km_kma(iv))
+            if lit:
+                n_lit += 1
+                mid_high.append((plon, plat, iv))
     if n_tot < 20:
         return None
     if mid_high:
         avg_g = sum(x[2] for x in mid_high) / len(mid_high)
     else:
         avg_g = 0
-    return (n_cld/n_tot*100, n_mh/n_tot*100, avg_g, mid_high, ts)
+    return (n_cld/n_tot*100, n_mh/n_tot*100, n_lit/n_tot*100, avg_g, mid_high, ts)
 
 def _fire_cloud_analyze_fy4(lat, lon, elev, az):
-    """风云四号太阳扇区中高云分析。返回 (cloud_rate, mh_rate, avg_g, cells, dt) 或 None。"""
+    """风云四号太阳扇区中高云分析（含"云底受光"几何过滤）。
+    返回 (cloud_rate, mh_rate, lit_rate, avg_g, cells, dt) 或 None。"""
     SECTOR, MAX_DIST = 70.0, 1500.0
     dt, img = _fy4_irx_latest()
     if img is None:
@@ -1088,7 +1126,7 @@ def _fire_cloud_analyze_fy4(lat, lon, elev, az):
     lon0, lon1, lat1, lat0 = 70.0, 135.0, 55.0, 10.0
     CELL = 3
     mid_high = []
-    n_sector_total = n_sector_cloud = n_sector_midhigh = 0
+    n_sector_total = n_sector_cloud = n_sector_midhigh = n_sector_lit = 0
     for yy in range(0, H, CELL):
         lat_y = lat1 - (lat1 - lat0) * (yy + 0.5) / H
         for xx in range(0, W, CELL):
@@ -1101,7 +1139,10 @@ def _fire_cloud_analyze_fy4(lat, lon, elev, az):
             if g >= 128: n_sector_cloud += 1
             if g >= 160:
                 n_sector_midhigh += 1
-                mid_high.append((lon_x, lat_y, g))
+                lit, _, _ = _cloud_base_lit(elev, dist, _cloud_top_km_fy4(g))
+                if lit:
+                    n_sector_lit += 1
+                    mid_high.append((lon_x, lat_y, g))
     if n_sector_total < 20:
         return None
     if mid_high:
@@ -1109,7 +1150,7 @@ def _fire_cloud_analyze_fy4(lat, lon, elev, az):
     else:
         avg_g = 0
     return (n_sector_cloud/n_sector_total*100, n_sector_midhigh/n_sector_total*100,
-            avg_g, mid_high, dt)
+            n_sector_lit/n_sector_total*100, avg_g, mid_high, dt)
 
 def fire_cloud_forecast(lat, lon, now=None, src="fy4"):
     """实时火烧云潜力预报。src: fy4(风云四号) / kma(GK2A 千里眼2A)。缓存 10 分钟。"""
@@ -1132,9 +1173,9 @@ def fire_cloud_forecast(lat, lon, now=None, src="fy4"):
             src_tag = "fy4"
         if res is None:
             return None
-        sector_cloud_rate, sector_mh_rate, avg_g, mid_high, time_tag = res
+        sector_cloud_rate, sector_mh_rate, sector_lit_rate, avg_g, mid_high, time_tag = res
         score, level, is_window, phase = _fire_cloud_score(
-            elev, az, sector_cloud_rate, sector_mh_rate, avg_g)
+            elev, az, sector_cloud_rate, sector_lit_rate, avg_g)
         if len(mid_high) > 2500:
             step = math.ceil(len(mid_high) / 2500)
             mid_high = mid_high[::step]
@@ -1150,12 +1191,14 @@ def fire_cloud_forecast(lat, lon, now=None, src="fy4"):
             "sector": {"az_center": round(az, 1), "half_width": 70.0, "max_dist_km": 1500,
                        "cloud_rate": round(sector_cloud_rate, 1),
                        "midhigh_rate": round(sector_mh_rate, 1),
+                       "lit_rate": round(sector_lit_rate, 1),
                        "avg_gray": round(avg_g, 1) if mid_high else None},
             "window": is_window,
             "cells": cells,
-            "note": f"火烧云潜力 = 观测点周边1500km内、日落/日出方向中高云覆盖率 + 云顶冷度 + 太阳高度角综合；"
+            "note": f"火烧云潜力 = 观测点周边1500km内、日落/日出方向中高云覆盖率 + 云底受光率 + 云顶冷度 + 太阳高度角综合；"
                     f"数据源：{src_name}红外云图；中高云（卷云/高层云）最易被染红，云量适中(15-75%)最佳。"
-                    f"绘制范围为太阳扇区内中高云区域。",
+                    f"绘制范围仅为太阳扇区内『云底受光』的中高云：阳光须从云边界下方空隙穿过照亮云底"
+                    f"（几何模型 θ_sun∈(-D/2R, h_base/D-D/2R)），未受光云底不会形成火烧云，已剔除。",
         }
         cache_put(key, out)
         return out
@@ -2882,14 +2925,16 @@ function renderFireCloud(d){
   const lv=d.level==='高'?'#e05a2b':d.level==='中'?'#c07f2a':d.level==='低'?'#8aa0b0':'#9aa8b5';
   const sun=d.sun,s=d.sector,t=new Date(d.time_bj);
   const pct=Math.max(0,Math.min(100,s.midhigh_rate));
+  const litPct=Math.max(0,Math.min(100,s.lit_rate||0));
   let html=`<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px"><span style="font-size:11px;color:var(--muted)">数据源</span><button onclick="switchFireSrc('fy4')" style="padding:5px 10px;font-size:11.5px;${d.src==='fy4'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">风云四号</button><button onclick="switchFireSrc('kma')" style="padding:5px 10px;font-size:11.5px;${d.src==='kma'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">KMA 千里眼2A</button></div>`;
   html+='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">';
   html+=`<div style="min-width:96px;padding:12px 10px;border-radius:12px;background:linear-gradient(135deg,#fdf0e4,#f6dcc2);text-align:center"><div style="font-size:11px;color:#a06a1f">潜力评分</div><div style="font-size:26px;font-weight:800;color:${lv}">${d.score}</div><div style="font-size:11px;font-weight:700;color:${lv}">${d.level}</div></div>`;
-  html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区中高云占比（卷云/高层云最易染红）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${pct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>中高云 <b>${s.midhigh_rate}%</b></span><span>总云量 ${s.cloud_rate}%</span><span style="color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</span></div></div></div>`;
+  html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区『云底受光』中高云占比（阳光从云边界下方穿过照亮云底才算）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${litPct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>云底受光 <b>${(s.lit_rate||0).toFixed(1)}%</b></span><span>中高云 ${s.midhigh_rate}%</span><span>总云量 ${s.cloud_rate}%</span><span style="color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</span></div></div></div>`;
   const rows=[
     ['时段','<b>'+sun.phase+'</b>（太阳方位 '+sun.az+'° · 高度角 '+sun.elev+'°）'],
     ['扇区','太阳方位 ±'+s.half_width+'° 扇形内统计'],
-    ['云顶冷度',s.avg_gray!=null?'平均灰度 <b>'+s.avg_gray+'</b>（越高越冷）':'无中高云'],
+    ['云底受光',(s.lit_rate||0)!==0?'<b style="color:#e05a2b">'+s.lit_rate+'%</b> 中高云可被低角度阳光照亮':'<b>0%</b>（云底处于阴影）'],
+    ['云顶冷度',s.avg_gray!=null?'平均灰度 <b>'+s.avg_gray+'</b>（越高越冷）':'无受光中高云'],
     ['黄金窗口',d.window?'<b style="color:#e05a2b">处于日出/日落 ±10° 窗口</b>':'当前不在日出/日落窗口'],
   ];
   html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
