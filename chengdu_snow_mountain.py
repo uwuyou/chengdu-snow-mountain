@@ -3455,8 +3455,43 @@ function renderFireCloud(d){
   html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
   if(litNote)html+=`<div class="hist-note" style="margin-top:10px;color:#b07a2a">💡 ${litNote}。<br>点击下方「定位到火烧云范围」将跳转到太阳方向扇区查看（黄色楔形范围）。</div>`;
   html+='<div class="obs-note" style="margin-top:10px">'+d.note+'</div>';
-  html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px">定位到火烧云范围</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变=中高云分布范围</span></div>`;
+  html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px;font-weight:600">定位到火烧云范围（查看实况详解）</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变+亮橙圆点=云底受光中高云位置</span></div>`;
   return html;
+}
+function fireCloudExplain(d){
+  // v2.10.26: 点击「定位到火烧云范围」时生成详细实况解释面板
+  const sun=d.sun,s=d.sector;
+  const cells=d.cells||[];
+  const side=Math.round(sun.az)>=180?'西南侧(日落方向)':'东南侧(日出方向)';
+  const zhengwu=sun.elev>10,yejian=sun.elev<-10;
+  let geo;
+  if(yejian) geo=`太阳已降至地平线下 ${Math.abs(sun.elev)}°，无阳光入射，任何云层都不可能被照亮，基本不具备火烧云条件`;
+  else if(zhengwu) geo=`太阳高度角 ${sun.elev}° 属"白天正午偏高"型：阳光从云层上方/侧面高位射入，只能在云顶形成强光，无法穿过云边界下方的空隙照亮云底，火烧云典型红染层（卷云/高层云的云底）无从形成`;
+  else geo=`太阳高度角 ${sun.elev}° 接近地平线（${sun.phase} 阶段），属于火烧云"低角度黄金相位"：阳光以接近水平的角度射向云团，只要云底高度/距离满足几何窗口（θ_sun∈(-D/2R, h_base/D-D/2R)），就具备云底染红的物理条件`;
+  let litDesc,diffDesc;
+  if((s.lit_rate||0)===0){litDesc='扇区内的中高云均未通过"云底受光"几何判定，处于阳光阴影中';diffDesc='云底受光率 0%，是当前阻止形成火烧云的决定性因素'}
+  else{litDesc=`扇区内有 ${cells.length} 个（约${(s.lit_rate||0).toFixed(1)}%像元）中高云通过几何判定，云底可被低角度阳光照亮`;diffDesc=`受光率为 ${(s.lit_rate||0).toFixed(1)}%，${(s.lit_rate||0)>=8?'已具备成云底染红的物质基础':'偏低，染红效果会偏弱/偏局部'}`}
+  const cloudDesc=s.midhigh_rate>=75?'覆盖率很高(天空几乎被中高云铺满)，云底受光区域与观测点之间的通透视线可能受限'
+    :s.midhigh_rate>=40?'覆盖率适中(15-75%理想区间)，利于出现"云朵染红"的层次感'
+    :'覆盖率偏低，受光云显得零星，染红范围可能不够壮观';
+  const coldDesc=s.avg_gray!=null?(s.avg_gray>=200?'云顶灰度 '+s.avg_gray+'hr（偏冷高耸，多为卷云/高层云塔，较易承接霞光）':'云顶灰度 '+s.avg_gray+'hr（中等，可能偏中云）'):'扇区无受光中高云';
+  const winDesc=d.window?'当前处于日出/日落 ±10° 黄金窗口，是观测火烧云的理想时段':'当前不在日出/日落黄金窗口（正午偏高或夜间/深夜）';
+  const rows=[
+    ['太阳几何',geo],
+    ['云底受光',litDesc+'。'+diffDesc],
+    ['扇区云量','太阳方位 '+sun.az+'° ±'+s.half_width+'° 扇形（半径 '+s.max_dist_km+'km）内，总云量 '+s.cloud_rate+'%，中高云 '+s.midhigh_rate+'%。'+cloudDesc],
+    ['云顶冷度',coldDesc],
+    ['黄金窗口',winDesc],
+  ];
+  const scoreNow=d.score<40?'当前潜力评分 '+d.score+'（弱），主要受 '+(s.lit_rate||0)===0?'云底受光不足':'太阳高度角偏高'+' 抑制'
+    :(d.score<70?'当前潜力评分 '+d.score+'（中），云底受光与云量配合尚可，可关注未来 1-2 小时低角度演化':'当前潜力评分 '+d.score+'（高），云底受光充分，处于较强的火烧云潜势');
+  return `<div class="fc-fit-tip" style="margin-top:10px;padding:10px 12px;border-radius:10px;background:linear-gradient(135deg,#fdf3e3,#fffbf2);border:1px solid #ecd9a8;font-size:12px">
+    <div style="font-weight:800;color:#a06a1f;font-size:13px;margin-bottom:8px">🔥 火烧云实况详解（${side} · 太阳方位 ${Math.round(sun.az)}°）</div>
+    <table style="width:100%;border-collapse:collapse">
+      ${rows.map(r=>`<tr><td style="vertical-align:top;padding:4px 8px 4px 0;white-space:nowrap;color:#a06a1f;font-weight:700">${r[0]}</td><td style="vertical-align:top;padding:4px 0;color:#5a4632;line-height:1.5">${r[1]}</td></tr>`).join('')}
+    </table>
+    <div style="margin-top:8px;padding-top:8px;border-top:1px dashed #e6cf9e;font-weight:700;color:#8a5a1f">结论：${scoreNow}</div>
+  </div>`;
 }
 function destPtWgs(lat,lon,km,azDeg){
   const R=6371,br=azDeg*Math.PI/180,d=km/R,la=lat*Math.PI/180,lo=lon*Math.PI/180;
@@ -3507,6 +3542,16 @@ function drawFireCloudMap(d,fast){
         g.addColorStop(1,`rgba(${rr},${gg},${bb},0)`);
         ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,rPx,0,Math.PI*2);ctx.fill();
       });
+      // v2.10.26: 明确标出『云底受光』云层位置——在渐变云区上叠加鲜橙亮点+白描边圆点
+      const dotR=Math.max(3,rPx*0.22);
+      cells.forEach(c=>{
+        const p=map.latLngToContainerPoint(wgsToGcj(c.lat,c.lon));
+        const x=(p.x-nw.x)*sc,y=(p.y-nw.y)*sc;
+        if(x<-dotR||y<-dotR||x>W+dotR||y>H+dotR)return;
+        ctx.beginPath();ctx.arc(x,y,dotR,0,Math.PI*2);
+        ctx.fillStyle='rgba(255,120,40,.85)';ctx.fill();
+        ctx.lineWidth=1;ctx.strokeStyle='rgba(255,255,255,.95)';ctx.stroke();
+      });
       const ov=L.imageOverlay(cv.toDataURL(),bnds,{opacity:fast?0.92:0,interactive:false}).addTo(grp);
       if(!fast)setTimeout(()=>{ov.setOpacity(.92)},30);
     }
@@ -3516,6 +3561,7 @@ function drawFireCloudMap(d,fast){
 function fitFireCloud(){
   // v2.10.23: 修复"点击没反应"——无受光云(cells为空)时不再静默return，
   // 改为定位到太阳扇区并给出提示；单点云区时用扇区端点兜底防 fitBounds 退化。
+  // v2.10.26: 定位后插入「详细实况解释面板」fireCloudExplain。
   if(!_fcData)return;
   const lat=+$('lat').value,lon=+$('lon').value;
   const az=_fcData.sun.az,hw=_fcData.sector.half_width;
@@ -3531,16 +3577,17 @@ function fitFireCloud(){
   switchTab('live');
   setTimeout(()=>{
     liveMap.fitBounds(b,{padding:[24,24],maxZoom:7});
-    // 无受光云时给出定位反馈
-    if(!cells.length){
-      const boxEl=$('fireCloudBox');if(!boxEl||boxEl.querySelector('.fc-fit-tip'))return;
-      const tip=document.createElement('div');
-      tip.className='fc-fit-tip';
-      tip.style.cssText='margin-top:8px;padding:7px 10px;border-radius:8px;background:#fdf3e3;color:#a06a1f;font-size:11.5px;border:1px solid #ecd9a8';
-      tip.innerHTML='📍 当前无『云底受光』中高云（受光率 0%），已定位到太阳方向扇区（黄色楔形范围）。'
-        +(_fcData.sun.elev>10?'太阳高度角 '+_fcData.sun.elev+'° 过高，阳光无法从地平线方向射入云底下方，不会形成火烧云。':'');
-      boxEl.appendChild(tip);
-    }
+    // 插入详细实况解释面板（始终显示）——放在地图容器的火烧云信息区上方
+    const boxEl=$('fireCloudBox');if(!boxEl)return;
+    let explain=boxEl.querySelector('.fc-fit-tip');
+    if(explain)explain.remove();                 // 移除旧的，避免堆积
+    const ex=document.createElement('div');
+    ex.className='fc-fit-tip';
+    ex.style.marginTop='8px';
+    ex.innerHTML=fireCloudExplain(_fcData);
+    // 插入到算法说明 obs-note 之前
+    const obsNote=boxEl.querySelector('.obs-note');
+    if(obsNote)boxEl.insertBefore(ex,obsNote); else boxEl.appendChild(ex);
   },120);
 }
 // v2.9.8: 西南区域裁剪放大（CSS 定位+缩放，避免跨域图片污染 canvas）
