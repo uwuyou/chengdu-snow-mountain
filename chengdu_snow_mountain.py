@@ -2236,10 +2236,10 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 /* v2.10.9: Windy 实况嵌入式板块 */
 .windy-panel{width:100%}.windy-ctl{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px}.windy-ctl button{flex:1;min-width:76px;padding:8px 6px;font-size:12px;border-radius:8px;background:#f4f7f9;border-color:#e0e7ec;color:#3b5163;white-space:nowrap}.windy-ctl button.on{background:var(--accent);border-color:var(--accent);color:#fff}.windy-box{position:relative;width:100%;aspect-ratio:16/9;background:#0b1220;border-radius:10px;overflow:hidden;border:1px solid var(--line)}.windy-box iframe{position:absolute;inset:0;width:100%;height:100%;border:0;display:block}.windy-note{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.7}.windy-note b{color:var(--accent)}.windy-load{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#8aa0b0;font-size:13px;letter-spacing:1px;background:#0b1220;pointer-events:none;transition:opacity .3s}.windy-box.loading .windy-load{opacity:1}.windy-box .windy-load{opacity:0}
 /* v2.10.10: Windy.app 数值云图瓦片板块（数据源/云量类型切换） */
-.wm-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.wm-ctl .grp{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.wm-ctl .grp b{font-size:11px;color:var(--muted);font-weight:600;margin-right:2px}.wm-ctl button{min-width:0;padding:6px 10px;font-size:12px;border-radius:8px;background:#f4f7f9;border-color:#e0e7ec;color:#3b5163;white-space:nowrap}.wm-ctl button.on{background:var(--accent);border-color:var(--accent);color:#fff}.wm-map{height:420px;border-radius:10px;background:#0b1220;border:1px solid var(--line);position:relative}.wm-note{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.7}.wm-note b{color:var(--accent)}.wm-status{font-size:11px;color:var(--muted);margin:2px 0 8px}.wm-legend{display:flex;gap:10px;flex-wrap:wrap;font-size:10.5px;color:var(--muted);margin-top:5px}.wm-legend i{display:inline-block;width:14px;height:3px;border-radius:2px;vertical-align:middle;margin-right:3px}
+.wm-ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}.wm-ctl .grp{display:flex;gap:4px;align-items:center;flex-wrap:wrap}.wm-ctl .grp b{font-size:11px;color:var(--muted);font-weight:600;margin-right:2px}.wm-ctl button{min-width:0;padding:6px 10px;font-size:12px;border-radius:8px;background:#f4f7f9;border-color:#e0e7ec;color:#3b5163;white-space:nowrap}.wm-ctl button.on{background:var(--accent);border-color:var(--accent);color:#fff}.wm-map{height:420px;border-radius:10px;background:#0b1220;border:1px solid var(--line);position:relative}.wm-note{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.7}.wm-note b{color:var(--accent)}.wm-status{font-size:11px;color:var(--muted);margin:2px 0 8px}
 @media(max-width:780px){.wm-map{height:320px}.wm-ctl .grp{width:100%}}
 </style></head><body><div class="wrap"><div class="hero"><div><h1>成都 · 看雪山</h1><p>数值预报 × 观山经验 综合测算观测指数</p></div><button class="primary" onclick="loadAll()">刷新全部数据</button></div>
-<nav class="tabs-nav"><button class="tab-btn active" data-tab="fc" onclick="switchTab('fc')">天气预报</button><button class="tab-btn" data-tab="live" onclick="switchTab('live')">实况观测</button><button class="tab-btn" data-tab="hist" onclick="switchTab('hist')">历史回顾</button><button class="tab-btn" data-tab="kb" onclick="switchTab('kb')">观山知识</button><button class="tab-btn" data-tab="windy" onclick="switchTab('windy')">Windy 实况</button><button class="tab-btn" data-tab="wm" onclick="switchTab('wm')">Windy 云图</button></nav>
+<nav class="tabs-nav"><button class="tab-btn active" data-tab="fc" onclick="switchTab('fc')">天气预报</button><button class="tab-btn" data-tab="live" onclick="switchTab('live')">实况观测</button><button class="tab-btn" data-tab="hist" onclick="switchTab('hist')">历史回顾</button><button class="tab-btn" data-tab="kb" onclick="switchTab('kb')">观山知识</button><button class="tab-btn" data-tab="windy" onclick="switchTab('windy')">Windy 实况</button><button class="tab-btn" data-tab="wm" onclick="switchTab('wm')">卫星云图</button></nav>
 <div id="pane-live" class="tab-pane"><div class="panel"><div class="obs-title">观测点地图 <span class="tag2">拖动蓝点调整观测位置 · 松手自动刷新实况与云量趋势</span></div><div id="liveMap"></div><div class="legend"><span>● 观测点（可拖动）</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">当前天气实况 <span class="tag2">中央气象台站点观测 + Open-Meteo 当前时次</span></div><div id="currentBox"><div class="cur-panel" style="justify-content:center;color:var(--muted);font-size:13px">正在获取实况观测…</div></div></div><div id="obsBox" class="panel obs-panel" style="display:none"></div><div class="panel" style="margin-top:12px"><div class="obs-title">风云四号实况云况分析 <span class="tag2">红外云检测（白=云）· 跟随当前观测点 · 自动刷新</span></div><div id="fy4CloudBox"><div class="hist-note" style="color:var(--muted)">正在获取风云四号云况分析…</div></div></div></div>
 <div id="pane-fc" class="tab-pane active"><div class="grid"><section class="panel"><div class="obs-title">预报设置 <span class="tag2">观测点 · 海拔 · 模型</span></div><div class="inputs"><label>纬度<input id="lat" value="{{observer.lat}}"></label><label>经度<input id="lon" value="{{observer.lon}}"></label><label>海拔 m（自动）<input id="elev" value="读取中" readonly></label><label>地点<input id="name" value="{{observer.name}}"></label><label class="wide">天气预报数据源<select id="model" onchange="loadAll()"><option value="best_match">智能最佳匹配（推荐）</option><option value="ecmwf_ifs025">ECMWF IFS 0.25°</option><option value="gfs_seamless">NOAA GFS</option><option value="icon_seamless">DWD ICON</option><option value="cma_grapes_global">中国气象局 CMA GRAPES</option><option value="jma_seamless">日本气象厅 JMA</option></select></label></div><div class="actions"><button onclick="locate()">手机定位</button><button onclick="loadAll()">更新全部数据</button></div><div id="modelStatus" class="status" style="display:none">天气模型：正在获取…</div><div id="aerosol" class="status" style="display:none">气溶胶：正在获取 Open-Meteo 数据…</div></section><section class="panel"><div class="obs-title">观测地图 <span class="tag2">可拖动观测点 · 海拔分区</span></div><div id="map"></div><div class="legend"><span>● 观测点</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span><span style="color:#d64541">● 云层遮挡视线</span><span style="color:#4a9d78">■ 低海拔 &lt;1500m</span><span style="color:#c98a2b">■ 中海拔 1500–3500m</span><span style="color:#8a6bbd">■ 高海拔 ≥3500m</span></div></section></div>
 <div id="cards" class="cards"></div></div>
@@ -2249,7 +2249,7 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 <div id="pane-kb" class="tab-pane"><div class="rules">{% for t,c,s in rules %}<div class="rule"><b>{{ t }}</b>{{ c }}<small>来源：{{ s }}</small></div>{% endfor %}</div>
 <details class="evidence"><summary>历史成功案例库（{{ success_cases|length }} 例 · 均来自公开报道，可对照学习经验规律）</summary><div class="sample-list">{% for c in success_cases %}<div class="sample"><b>{{ c.date }}</b><div>{{ c.cond }} → {{ c.sight }}</div><span class="tag">{{ c.src }}</span></div>{% endfor %}</div></details></div></div>
 <div id="pane-windy" class="tab-pane"><div class="windy-panel"><div class="panel"><div class="obs-title">Windy 实况地图 <span class="tag2">嵌入式实时气象图层 · 自动跟随当前观测点</span></div><div class="windy-ctl"><button data-windylayer="wind" class="on" onclick="setWindyLayer('wind',this)">风场</button><button data-windylayer="satellite" onclick="setWindyLayer('satellite',this)">卫星云图</button><button data-windylayer="clouds" onclick="setWindyLayer('clouds',this)">云量</button><button data-windylayer="temp" onclick="setWindyLayer('temp',this)">温度</button><button data-windylayer="rain" onclick="setWindyLayer('rain',this)">降水</button><button data-windylayer="rh" onclick="setWindyLayer('rh',this)">湿度</button><button data-windylayer="pressure" onclick="setWindyLayer('pressure',this)">气压</button></div><div id="windyBox" class="windy-box loading"><div class="windy-load">正在加载 Windy 实时地图…</div></div><div class="windy-note">数据由 <b>Windy.com</b> 通过嵌入式 iframe 提供（ECMWF/GFS/ICON 模型叠加实时观测与卫星云图），随你的观测点与所选图层实时更新。卫星云图可直观观察西部雪山区域云况。</div></div></div></div>
-<div id="pane-wm" class="tab-pane"><div class="panel"><div class="obs-title">Windy 数值云图 <span class="tag2">windy.app 云量栅格瓦片 · 直接爬取实时渲染</span></div><div class="wm-ctl"><span class="grp"><b>数据源</b><button data-wm-model="ECMWF" class="on" onclick="setWmModel('ECMWF',this)">ECMWF</button><button data-wm-model="GFS27" onclick="setWmModel('GFS27',this)">GFS27</button><button data-wm-model="ICONGLOBAL" onclick="setWmModel('ICONGLOBAL',this)">ICON13</button></span><span class="grp"><b>云量</b><button data-wm-type="tcdc_total" class="on" onclick="setWmType('tcdc_total',this)">总云量</button><button data-wm-type="tcdc_med" onclick="setWmType('tcdc_med',this)">中云</button><button data-wm-type="tcdc_low" onclick="setWmType('tcdc_low',this)">低云</button><button data-wm-type="tcdc_high" onclick="setWmType('tcdc_high',this)">高云</button></span><span class="grp"><b>实况</b><button data-wm-sat="fy4" onclick="toggleFy4Sat(this)">风云四号红外</button><button data-wm-sat="wxbl" onclick="toggleFy4Sat(this)">真彩色云图</button></span></div><div id="wmStatus" class="wm-status">正在初始化…</div><div id="wmMap" class="wm-map"></div><div class="wm-legend"><span><i style="background:rgba(80,180,255,.85)"></i>云量少</span><span><i style="background:rgba(160,220,240,.9)"></i>云量中等</span><span><i style="background:rgba(255,255,255,.95)"></i>云量大（云层厚）</span></div><div class="wm-note">数据由 <b>windy.app</b> 瓦片服务直接提供（ECMWF/GFS27/ICON13 数值预报模型的云量栅格，无需 API Key）。瓦片随地图缩放实时加载，可拖动查看川西走廊全线云况；点击左上角图层按钮可切换高德底图（标准/卫星）。「<b>风云四号红外</b>」叠加国家卫星气象中心 WMS 红外云图（24 小时可用，白色为云），「<b>真彩色云图</b>」叠加中央气象台风云四号 B 星真彩色（仅白天）。</div></div></div>
+<div id="pane-wm" class="tab-pane"><div class="panel"><div class="obs-title">风云四号卫星云图 <span class="tag2">红外动画（多时次）· 真彩色叠加 · 跟随当前观测点</span></div><div class="wm-ctl"><span class="grp"><b>实况</b><button data-wm-sat="fy4" onclick="toggleFy4Sat(this)">风云四号红外</button><button data-wm-sat="wxbl" onclick="toggleFy4Sat(this)">真彩色云图</button></span></div><div id="wmStatus" class="wm-status">正在初始化…</div><div id="wmMap" class="wm-map"></div><div class="wm-note">「<b>风云四号红外</b>」叠加国家卫星气象中心 WMS 红外云图（24 小时可用，白色为云，近 2 小时多时次动画循环），「<b>真彩色云图</b>」叠加中央气象台风云四号 B 星真彩色（仅白天）。点击左上角图层按钮可切换高德底图（标准/卫星）。</div></div></div>
 <div id="simModal" class="modal" onclick="if(event.target===this)closeSimulation()"><div class="sim-box"><div class="sim-head"><div><h3 id="simTitle">天空形态模拟</h3><div id="simSub" class="meta"></div></div><button class="sim-close" onclick="closeSimulation()">关闭</button></div><canvas id="simCanvas" class="sim-canvas"></canvas><div id="simMetrics" class="sim-metrics"></div><div id="simNote" class="sim-note"></div></div></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
 const gaodeOpt={subdomains:'1234',maxZoom:18,attribution:'地图 © 高德'};
@@ -2355,59 +2355,24 @@ function setWindyLayer(layer,btn){
   document.querySelectorAll('.windy-ctl button').forEach(b=>b.classList.toggle('on',b===btn));
   renderWindy();
 }
-// v2.10.10: Windy.app 数值云图瓦片——数据源/云量类型切换（直接爬取瓦片渲染，无需 API Key）
-let _wmModel='ECMWF',_wmType='tcdc_total',_wmMap=null,_wmTile=null;
-const WM_MODEL_MAXZ={ECMWF:7,GFS27:5,ICONGLOBAL:7};
-function wmTs(){
-  const now=Math.floor(Date.now()/1000);
-  return Math.floor(now/3600)*3600;   // 当前 UTC 整点帧
-}
-function wmUrl(){
-  const ts=wmTs();
-  return `https://tiles-web.windyapp.co/v10/tiles/${_wmModel}/${_wmType}/${ts}/{z}/{x}/{y}`;
-}
+// v2.10.16: 卫星云图底图（移除 windy.app 数值云量瓦片，仅保留风云四号红外/真彩色叠加）
+let _wmMap=null;
 function wmInit(){
   if(_wmMap){_wmMap.invalidateSize();return}
   const el=$('wmMap');if(!el)return;
   _wmMap=L.map('wmMap',{layers:[gaodeRoad]}).setView([+$('lat').value||30.657,+$('lon').value||104.058],6);
   _wmMap.createPane('wmPane');_wmMap.getPane('wmPane').style.zIndex=400;
-  _wmTile=L.tileLayer(wmUrl(),{pane:'wmPane',tms:false,opacity:.92,maxZoom:WM_MODEL_MAXZ[_wmModel],maxNativeZoom:7}).addTo(_wmMap);
   L.control.layers({'高德标准地图':gaodeRoad,'高德卫星影像':gaodeSatellite},null,{position:'topright',collapsed:true}).addTo(_wmMap);
   _wmMap.on('zoomend',()=>setWmStatus());
-  setWmStatus('已加载 · '+fmtWmTime(wmTs()));
-}
-function fmtWmTime(ts){
-  const d=new Date(ts*1000);
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')} ${String(d.getUTCHours()).padStart(2,'0')}:00 UTC（北京时间 ${String((d.getUTCHours()+8)%24).padStart(2,'0')}:00）`;
+  setWmStatus('底图已加载');
 }
 function setWmStatus(extra){
   const s=$('wmStatus');if(!s)return;
   const mz=_wmMap?_wmMap.getZoom():6;
-  s.textContent=`数据源 ${_wmModel} · ${_wmType==='tcdc_total'?'总云量':_wmType==='tcdc_med'?'中云':_wmType==='tcdc_low'?'低云':'高云'} · 缩放级别 ${mz} · 当前帧 ${fmtWmTime(wmTs())}${extra?(' · '+extra):''}`;
+  s.textContent=`缩放级别 ${mz}${extra?(' · '+extra):''}`;
 }
-function setWmModel(model,btn){
-  if(_wmModel===model)return;
-  _wmModel=model;
-  document.querySelectorAll('.wm-ctl [data-wm-model]').forEach(b=>b.classList.toggle('on',b.dataset.wmModel===model));
-  applyWm();
-}
-function setWmType(type,btn){
-  if(_wmType===type)return;
-  _wmType=type;
-  document.querySelectorAll('.wm-ctl [data-wm-type]').forEach(b=>b.classList.toggle('on',b.dataset.wmType===type));
-  applyWm();
-}
-function applyWm(){
-  if(!_wmMap){wmInit();return}
-  if(_wmTile){_wmMap.removeLayer(_wmTile)}
-  _wmTile=L.tileLayer(wmUrl(),{pane:'wmPane',tms:false,opacity:.92,maxZoom:WM_MODEL_MAXZ[_wmModel],maxNativeZoom:7}).addTo(_wmMap);
-  // GFS27 分辨率低，若当前缩放超过模型上限则自动缩回可显示级别
-  const maxz=WM_MODEL_MAXZ[_wmModel];
-  if(_wmMap.getZoom()>maxz){_wmMap.setZoom(maxz,{animate:true})}
-  setWmStatus('已切换');
-}
-// v2.10.10: 标签页切换时若 Windy 云图已初始化过则保持状态
-function wmRefresh(){if(_wmMap)applyWm()}
+// v2.10.10: 标签页切换时若卫星云图已初始化过则保持状态
+function wmRefresh(){if(_wmMap)_wmMap.invalidateSize()}
 // v2.10.12: 风云四号实况云图叠加（红外 WMS 裁剪图 / 真彩色云图）
 let _wmSat=null,_wmSatLayer=null,_wmAnimUrl=null;
 function toggleFy4Sat(btn){
