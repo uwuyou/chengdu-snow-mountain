@@ -33,6 +33,7 @@ import io
 import json
 import math
 import os
+import pickle
 import re
 import threading
 import time
@@ -170,15 +171,56 @@ def apparent_peak_angle(distance_km, peak_elev, observer_elev):
     return math.degrees(math.atan2(peak_elev-observer_elev-drop, d))
 
 
-def cache_get(key, max_age):
-    with _cache_lock:
-        item = _cache.get(key)
-        return item[1] if item and time.time()-item[0] < max_age else None
+# v3.x: 磁盘持久化缓存——GFS/CAMS 下载极慢（冷启动可达 200s+），而 PaaS(如 Zeabur)
+# 空闲会停实例、清空内存缓存，导致每次冷启动都重新下载 → 前端等不到预报卡片。
+# 对昂贵的 key(gfsmeteo/cams/forecast)写透到 /tmp 磁盘，重启后直接复用，避免重复冷下载。
+_CACHE_DISK_DIR = "/tmp/csm_cachedata"
+_PERSIST_PREFIXES = ("gfsmeteo:", "cams:", "forecast:")
+
+
+def _cache_disk_path(key):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return os.path.join(_CACHE_DISK_DIR, safe + ".pkl")
+
+
+def _cache_load_disk(key):
+    """从磁盘加载该 key 的 (ts, value)，成功则回填内存。返回 (ts,value) 或 None。"""
+    try:
+        p = _cache_disk_path(key)
+        if os.path.isfile(p):
+            with open(p, "rb") as f:
+                ts, value = pickle.load(f)
+            with _cache_lock:
+                if key not in _cache:
+                    _cache[key] = (ts, value)
+            return ts, value
+    except Exception:
+        pass
+    return None
 
 
 def cache_put(key, value):
     with _cache_lock:
         _cache[key] = (time.time(), value)
+    if key.startswith(_PERSIST_PREFIXES):
+        try:
+            if not os.path.isdir(_CACHE_DISK_DIR):
+                os.makedirs(_CACHE_DISK_DIR, exist_ok=True)
+            with open(_cache_disk_path(key), "wb") as f:
+                pickle.dump((time.time(), value), f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            pass
+
+
+def cache_get(key, max_age):
+    with _cache_lock:
+        item = _cache.get(key)
+        if item and time.time() - item[0] < max_age:
+            return item[1]
+    if not key.startswith(_PERSIST_PREFIXES):
+        return None
+    ts, value = _cache_load_disk(key)
+    return value if (value is not None and ts is not None and time.time() - ts < max_age) else None
 
 
 def cache_get_stale(key, max_age):
@@ -186,9 +228,14 @@ def cache_get_stale(key, max_age):
     供数据源 429/故障时回退到过期数据，避免整个预报失败。"""
     with _cache_lock:
         item = _cache.get(key)
-        if not item:
-            return None, False
-        return item[1], time.time() - item[0] >= max_age
+        if item:
+            return item[1], time.time() - item[0] >= max_age
+    if not key.startswith(_PERSIST_PREFIXES):
+        return None, False
+    loaded = _cache_load_disk(key)
+    if loaded is None:
+        return None, False
+    return loaded[1], time.time() - loaded[0] >= max_age
 
 
 # ---- Open-Meteo 限流加固（v2.10.25）----
@@ -3219,6 +3266,13 @@ def _forecast_weather(observer, model="best_match", use_gfs=True):
 
 def build_forecast(observer, model="best_match"):
     if model not in WEATHER_MODELS: model="best_match"
+    # v3.x: 整个预报结果缓存 5 分钟（按地点+名称+模型+数据源开关），配合磁盘持久化，
+    # PaaS 重启/冷启动后重复请求可秒开，避免每次都触发 GFS/CAMS 冷下载导致前端无卡片。
+    fkey = f"forecast:{observer['lat']:.4f},{observer['lon']:.4f},{model}," \
+           f"{observer.get('name','')},gfs={request.args.get('gfs','1').strip() if request else '1'}"
+    fc = cache_get(fkey, 300)
+    if fc is not None:
+        return fc
     warnings=[]
     # v3.x: 天气源优先直达 GFS 数值预报（NOMADS 0.25°），失败自动回退 Open-Meteo。
     # 提供独立开关参数 gfs 控制（默认 on），便于故障时一键关闭。
@@ -3293,13 +3347,15 @@ def build_forecast(observer, model="best_match"):
             item["terrain_note"] = (f"视线被 {occ_info['distance']:.0f}km 处海拔 {occ_info['terrain']:.0f}m 的地形"
                                     f"阻挡（该处视线高度仅 {occ_info['los']:.0f}m），峰顶被山体遮挡，当前观测点看不到该峰")
         result.append(item)
-    return {"observer":observer,"mountains":result,"weather_model":{"id":model,**WEATHER_MODELS[model]},"weather_source":"gfs" if weather_from=="gfs" else "openmeteo",
+    payload = {"observer":observer,"mountains":result,"weather_model":{"id":model,**WEATHER_MODELS[model]},"weather_source":"gfs" if weather_from=="gfs" else "openmeteo",
             "aerosol_source": aero_from,
             "aerosol":{"status":"ready","message":"CAMS Global 直连（ADS）· AOD550 · 自动缓存3小时" if aero_from=="cams" else "Open-Meteo CAMS Global · AOD550/PM2.5/沙尘 · 自动缓存1小时"},
             "warnings":warnings,"generated":datetime.now(TZ).isoformat(),
             "method":("GFS 全球 0.25° 数值直取（NOMADS）" if weather_from=="gfs" else "Open-Meteo 天气源")
                      + (" + CAMS AOD550 直连（ADS）" if aero_from=="cams" else " + Open-Meteo AOD550")
                      + " + 通道云量/湿度/能见度 + v2.0 经验知识层（前夜大雨洗尘/霾层积累/观山季/日出窗口/连续晴日） + v2.8 天气系统层（850hPa 冷空气/锋面切变/槽脊/逆温层）"}
+    cache_put(fkey, payload)   # v3.x: 整份缓存，配合磁盘持久化秒开重复请求
+    return payload
 
 
 @APP.get("/")
