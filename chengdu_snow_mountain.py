@@ -38,6 +38,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import requests
 from flask import Flask, jsonify, request, render_template_string, send_file
 from openpyxl import Workbook
@@ -954,110 +955,212 @@ def fy4_cloud_analysis(lat, lon, now=None):
         return None
 
 
-# ---- v2.10.18: 实时火烧云潜力预报 ----
+# ---- v2.10.19: 实时火烧云潜力预报（支持 风云四号 / KMA 千里眼2A 双数据源） ----
 # 原理：火烧云 = 日落/日出方向存在「中高云」+ 云量适中 + 太阳接近地平线。
-#   - 中高云识别：风云四号红外云图灰度≈亮温，云顶越冷(灰度高)越高。
-#     灰度 160-255(亮温约 -36℃ 以下) 视为中高云（卷云/高层云，能染红）。
+#   - 中高云识别：
+#       · 风云四号：红外云图灰度≈亮温，云顶越冷(灰度高)越高，灰度 160-255 视为中高云。
+#       · KMA GK2A：CIRA SLIDER band_13(10.3µm 红外)，ircimss2 增强色标索引 >=176
+#         （亮温约 -30℃ 以下）视为中高云。
 #   - 太阳方位扇区：取太阳方位角 ±70° 扇形内的云，是火烧云真正会出现的天空范围。
 #   - 评分：扇区内中高云覆盖率 15%-75% 最佳 + 云顶冷度 + 太阳高度角窗口(-6°~+6°)。
-# 输出：潜力评分 + 可绘制范围 GeoJSON（栅格→多边形，供前端丝滑渐变叠加）。
+# 输出：潜力评分 + 可绘制范围（中高云像元集合，前端 Canvas 渐变"丝滑"叠加）。
 
 def _azimuth_diff(a, b):
     """两方位角(0-360)之差，返回 0-180。"""
     d = abs(a - b) % 360
     return d if d <= 180 else 360 - d
 
-def fire_cloud_forecast(lat, lon, now=None):
-    """实时火烧云潜力预报。返回 dict 或 None。缓存 10 分钟。"""
-    key = f"obs:firec:{float(lat):.2f},{float(lon):.2f}"
+def _fire_cloud_score(elev, az, sector_cloud_rate, sector_mh_rate, avg_g):
+    """双源共用的火烧云评分。返回 (score, level, is_window, phase)。"""
+    if 15 <= sector_mh_rate <= 75:
+        s_cover = 100 - abs(sector_mh_rate - 40) * 1.2   # 40% 附近最优
+    else:
+        s_cover = max(0, 100 - abs(sector_mh_rate - 40) * 2.5)
+    if avg_g:
+        s_cold = min(100, (avg_g - 150) * 1.8)
+    else:
+        s_cold = 0
+    if -8 <= elev <= 8:
+        s_sun = 100 - abs(elev) * 9
+    else:
+        s_sun = max(0, 55 - abs(elev) * 4)
+    score = int(round(0.5 * s_cover + 0.3 * s_cold + 0.2 * s_sun))
+    score = max(0, min(100, score))
+    is_window = -10 <= elev <= 10
+    phase = ("黎明（日出）" if az < 180 else "黄昏（日落）") if is_window else \
+            ("白天（太阳偏高）" if elev > 10 else "夜间（太阳低于地平线）")
+    level = "高" if score >= 70 else ("中" if score >= 45 else ("低" if score >= 25 else "无"))
+    return score, level, is_window, phase
+
+# ---------- KMA GK2A 数据源（CIRA SLIDER，免登录，Web Mercator 瓦片） ----------
+SLIDER_CFG = dict(lon0=128.0, sat_alt=42171.7, max_rad_x=0.150618, max_rad_y=0.150485,
+                  disk_radius_x_z0=337, disk_radius_y_z0=336, tile_size=678, z_max=5)
+SLIDER_H_ALT, SLIDER_R, SLIDER_LON0 = 42171.7, 6378.1, math.radians(128.0)
+
+def _slider_inv_latlon(e, s):
+    """GK2A GEOS 扫描角(东正,北正) → (lat, lon)。球面近似。"""
+    ce, se, cs, ss = math.cos(e), math.sin(e), math.cos(s), math.sin(s)
+    A = ce * cs
+    disc = SLIDER_H_ALT*SLIDER_H_ALT*A*A - (SLIDER_H_ALT*SLIDER_H_ALT - SLIDER_R*SLIDER_R)
+    if disc < 0: return None
+    r = SLIDER_H_ALT*A - math.sqrt(disc)
+    if r <= 0: return None
+    x = SLIDER_H_ALT - r*A; y = r*se; z = r*ce*ss
+    return math.degrees(math.asin(z/SLIDER_R)), math.degrees(math.atan2(y, x)) + 128.0
+
+def _slider_latest_ts():
+    r = SESSION.get("https://slider.cira.colostate.edu/data/json/gk2a/full_disk/band_13/latest_times.json", timeout=15)
+    r.raise_for_status()
+    return str(r.json()["timestamps_int"][0])
+
+def _slider_full_png(ts, z=1):
+    """下载 GK2A 全盘 band_13 瓦片拼图（P 模式，索引即 ircimss2 色标值）。缓存 10 分钟。"""
+    key = f"obs:kmaimg:{ts}"
+    cached = cache_get(key, 600)
+    if cached is not None: return cached
+    ymd = f"{ts[:4]}/{ts[4:6]}/{ts[6:8]}"
+    n = 2 ** z
+    from PIL import Image as _Img
+    imgs = []
+    for rr in range(n):
+        for cc in range(n):
+            r = SESSION.get(
+                f"https://slider.cira.colostate.edu/data/imagery/{ymd}/gk2a---full_disk/band_13/{ts}/{z:02d}/{rr:03d}_{cc:03d}.png",
+                timeout=25)
+            r.raise_for_status()
+            imgs.append(_Img.open(io.BytesIO(r.content)).convert("P"))
+    W = imgs[0].width
+    full = _Img.new("P", (W*n, W*n))
+    for i, im in enumerate(imgs):
+        full.paste(im, ((i % n)*W, (i // n)*W))
+    cache_put(key, full)
+    return full
+
+def _fire_cloud_analyze_kma(lat, lon, elev, az):
+    """GK2A 太阳扇区中高云分析。返回 (cloud_rate, mh_rate, avg_g, cells) 或 None。"""
+    SECTOR, MAX_DIST = 70.0, 1500.0
+    ts = _slider_latest_ts()
+    full = _slider_full_png(ts)
+    arr = np.array(full)
+    Hh, Ww = arr.shape
+    z = 1
+    scale = 2 ** (SLIDER_CFG["z_max"] - z)
+    cx = cy = (SLIDER_CFG["tile_size"]/2) * 2**SLIDER_CFG["z_max"] / scale
+    sx_r = SLIDER_CFG["disk_radius_x_z0"] * 2**SLIDER_CFG["z_max"] / scale
+    sy_r = SLIDER_CFG["disk_radius_y_z0"] * 2**SLIDER_CFG["z_max"] / scale
+    max_x, max_y = SLIDER_CFG["max_rad_x"], SLIDER_CFG["max_rad_y"]
+    CELL = 2
+    n_tot = n_cld = n_mh = 0
+    mid_high = []
+    ys, xs = np.mgrid[CELL//2:Hh:CELL, CELL//2:Ww:CELL]
+    for yy, xx in zip(ys.ravel(), xs.ravel()):
+        iv = int(arr[yy, xx])
+        if iv <= 0: continue
+        e = (xx - cx)/sx_r * max_x
+        s = -(yy - cy)/sy_r * max_y
+        if e*e + s*s > 0.0232: continue   # 圆盘外（≈0.151²）
+        ll = _slider_inv_latlon(e, s)
+        if ll is None: continue
+        plat, plon = ll
+        if not (5 <= plat <= 65 and 60 <= plon <= 190): continue
+        dist, brg = haversine_bearing(lat, lon, plat, plon)
+        if dist > MAX_DIST or _azimuth_diff(brg, az) > SECTOR: continue
+        n_tot += 1
+        if iv >= 128: n_cld += 1
+        if iv >= 176:
+            n_mh += 1
+            mid_high.append((plon, plat, iv))
+    if n_tot < 20:
+        return None
+    if mid_high:
+        avg_g = sum(x[2] for x in mid_high) / len(mid_high)
+    else:
+        avg_g = 0
+    return (n_cld/n_tot*100, n_mh/n_tot*100, avg_g, mid_high, ts)
+
+def _fire_cloud_analyze_fy4(lat, lon, elev, az):
+    """风云四号太阳扇区中高云分析。返回 (cloud_rate, mh_rate, avg_g, cells, dt) 或 None。"""
+    SECTOR, MAX_DIST = 70.0, 1500.0
+    dt, img = _fy4_irx_latest()
+    if img is None:
+        return None
+    px = img.load(); W, H = img.size
+    lon0, lon1, lat1, lat0 = 70.0, 135.0, 55.0, 10.0
+    CELL = 3
+    mid_high = []
+    n_sector_total = n_sector_cloud = n_sector_midhigh = 0
+    for yy in range(0, H, CELL):
+        lat_y = lat1 - (lat1 - lat0) * (yy + 0.5) / H
+        for xx in range(0, W, CELL):
+            g = px[xx, yy]
+            if g < 40: continue
+            lon_x = lon0 + (lon1 - lon0) * (xx + 0.5) / W
+            dist, bearing = haversine_bearing(lat, lon, lat_y, lon_x)
+            if dist > MAX_DIST or _azimuth_diff(bearing, az) > SECTOR: continue
+            n_sector_total += 1
+            if g >= 128: n_sector_cloud += 1
+            if g >= 160:
+                n_sector_midhigh += 1
+                mid_high.append((lon_x, lat_y, g))
+    if n_sector_total < 20:
+        return None
+    if mid_high:
+        avg_g = sum(x[2] for x in mid_high) / len(mid_high)
+    else:
+        avg_g = 0
+    return (n_sector_cloud/n_sector_total*100, n_sector_midhigh/n_sector_total*100,
+            avg_g, mid_high, dt)
+
+def fire_cloud_forecast(lat, lon, now=None, src="fy4"):
+    """实时火烧云潜力预报。src: fy4(风云四号) / kma(GK2A 千里眼2A)。缓存 10 分钟。"""
+    src = src if src in ("fy4", "kma") else "fy4"
+    key = f"obs:firec:{src}:{float(lat):.2f},{float(lon):.2f}"
     cached = cache_get(key, 600)
     if cached is not None: return cached
     try:
         now = now or datetime.now(TZ)
         elev, az = solar_position(now, lat, lon)
-        # 1) 拉最新风云四号红外灰度图（共享缓存 + 重试）
-        dt, img = _fy4_irx_latest()
-        if img is None:
+        if src == "kma":
+            res = _fire_cloud_analyze_kma(lat, lon, elev, az)
+            time_tag = None
+            src_name = "KMA 千里眼2A (GK2A)"
+            src_tag = "kma"
+        else:
+            res = _fire_cloud_analyze_fy4(lat, lon, elev, az)
+            time_tag = None
+            src_name = "风云四号"
+            src_tag = "fy4"
+        if res is None:
             return None
-        px = img.load(); W, H = img.size
-        # 2) 地理映射（与 fy4_cloud_analysis 相同）
-        lon0, lon1, lat1, lat0 = 70.0, 135.0, 55.0, 10.0
-        # 3) 逐像元判断：是否中高云 + 是否在太阳扇区内 + 是否在有效半径内
-        SECTOR = 70.0          # 太阳方位 ±70° 扇区
-        MAX_DIST = 1500.0      # 有效半径 km（火烧云只看观测点周边，避免全境噪声）
-        CELL = 3               # 抽样步长（约 12km 网格）
-        mid_high = []          # 中高云像元 (lon, lat, 灰度)
-        n_sector_total = n_sector_cloud = n_sector_midhigh = 0
-        for yy in range(0, H, CELL):
-            lat_y = lat1 - (lat1 - lat0) * (yy + 0.5) / H
-            for xx in range(0, W, CELL):
-                g = px[xx, yy]
-                if g < 40:  # 无云/晴空
-                    continue
-                lon_x = lon0 + (lon1 - lon0) * (xx + 0.5) / W
-                # 像元相对观测点的距离与方位
-                dist, bearing = haversine_bearing(lat, lon, lat_y, lon_x)
-                if dist > MAX_DIST or _azimuth_diff(bearing, az) > SECTOR:
-                    continue
-                n_sector_total += 1
-                if g >= 128:
-                    n_sector_cloud += 1
-                if g >= 160:  # 中高云（云顶较冷）
-                    n_sector_midhigh += 1
-                    mid_high.append((lon_x, lat_y, g))
-        if n_sector_total < 20:
-            return None  # 太阳扇区内数据不足
-        sector_cloud_rate = n_sector_cloud / n_sector_total * 100
-        sector_mh_rate = n_sector_midhigh / n_sector_total * 100
-        # 4) 评分因子
-        #   a) 中高云覆盖率：15%-75% 最佳，过高过低都扣分
-        if 15 <= sector_mh_rate <= 75:
-            s_cover = 100 - abs(sector_mh_rate - 40) * 1.2   # 40% 附近最优
-        else:
-            s_cover = max(0, 100 - abs(sector_mh_rate - 40) * 2.5)
-        #   b) 云顶冷度：平均灰度越高（越冷）越容易染红
-        if mid_high:
-            avg_g = sum(x[2] for x in mid_high) / len(mid_high)
-            s_cold = min(100, (avg_g - 150) * 1.8)
-        else:
-            avg_g, s_cold = 0, 0
-        #   c) 太阳高度角窗口：-6°(黎明前/黄昏后) ~ +6° 最佳
-        if -8 <= elev <= 8:
-            s_sun = 100 - abs(elev) * 9
-        else:
-            s_sun = max(0, 55 - abs(elev) * 4)  # 太阳太高则潜力快速衰减
-        score = int(round(0.5 * s_cover + 0.3 * s_cold + 0.2 * s_sun))
-        score = max(0, min(100, score))
-        # 5) 时段判断
-        is_window = -10 <= elev <= 10   # 日出日落黄金窗口
-        phase = ("黎明（日出）" if az < 180 else "黄昏（日落）") if is_window else \
-                ("白天（太阳偏高）" if elev > 10 else "夜间（太阳低于地平线）")
-        # 6) 绘制范围：中高云像元集合（前端 Canvas 半透明渐变"丝滑"渲染）
-        #    像元过多时按采样率抽稀，控制载荷 ≤ 2500 点
+        sector_cloud_rate, sector_mh_rate, avg_g, mid_high, time_tag = res
+        score, level, is_window, phase = _fire_cloud_score(
+            elev, az, sector_cloud_rate, sector_mh_rate, avg_g)
         if len(mid_high) > 2500:
             step = math.ceil(len(mid_high) / 2500)
             mid_high = mid_high[::step]
         cells = [{"lon": round(x, 3), "lat": round(y, 3), "g": g_} for x, y, g_ in mid_high]
-        t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        t_utc = datetime.strptime(time_tag[:12], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
         out = {
             "ok": True,
-            "time_utc": dt, "time_bj": t_utc.astimezone(TZ).isoformat(),
+            "src": src_tag, "src_name": src_name,
+            "time_utc": time_tag, "time_bj": t_utc.astimezone(TZ).isoformat(),
             "sun": {"elev": round(elev, 1), "az": round(az, 1), "phase": phase},
             "score": score,
-            "level": "高" if score >= 70 else ("中" if score >= 45 else ("低" if score >= 25 else "无")),
-            "sector": {"az_center": round(az, 1), "half_width": SECTOR, "max_dist_km": int(MAX_DIST),
+            "level": level,
+            "sector": {"az_center": round(az, 1), "half_width": 70.0, "max_dist_km": 1500,
                        "cloud_rate": round(sector_cloud_rate, 1),
                        "midhigh_rate": round(sector_mh_rate, 1),
                        "avg_gray": round(avg_g, 1) if mid_high else None},
             "window": is_window,
             "cells": cells,
-            "note": "火烧云潜力 = 观测点周边1500km内、日落/日出方向中高云覆盖率 + 云顶冷度 + 太阳高度角综合；"
-                    "中高云（卷云/高层云）最易被染红，云量适中(15-75%)最佳。绘制范围为太阳扇区内中高云区域。",
+            "note": f"火烧云潜力 = 观测点周边1500km内、日落/日出方向中高云覆盖率 + 云顶冷度 + 太阳高度角综合；"
+                    f"数据源：{src_name}红外云图；中高云（卷云/高层云）最易被染红，云量适中(15-75%)最佳。"
+                    f"绘制范围为太阳扇区内中高云区域。",
         }
         cache_put(key, out)
         return out
     except Exception as e:
-        print(f"[fire_cloud] {type(e).__name__}: {e}", flush=True)
+        print(f"[fire_cloud:{src}] {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -2242,11 +2345,13 @@ def api_fy4_cloud():
 
 @APP.get("/api/fire-cloud")
 def api_fire_cloud():
-    """v2.10.18 实时火烧云潜力预报：太阳方位扇区内中高云识别 + 潜力评分 + 绘制范围。"""
+    """v2.10.19 实时火烧云潜力预报：太阳方位扇区内中高云识别 + 潜力评分 + 绘制范围。
+    src: fy4(风云四号) / kma(韩国 GK2A 千里眼2A)。"""
     try:
         lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
         lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
-        data = fire_cloud_forecast(lat, lon)
+        src = request.args.get("src", "fy4")
+        data = fire_cloud_forecast(lat, lon, src=src)
         if not data:
             return jsonify({"ok": False, "error": "火烧云预报暂不可用（数据源无响应或太阳扇区内云数据不足）"}), 502
         resp = jsonify({"ok": True, "data": data})
@@ -2755,12 +2860,18 @@ function renderFy4Cloud(d){
   html+=`<div class="obs-note" style="margin-top:10px">${d.note}</div>`;
   return html;
 }
-// v2.10.18: 实时火烧云潜力预报（风云四号红外 + 太阳扇区中高云识别 + 地图丝滑绘制）
-let _fcData=null,_fcLayer=null;
+// v2.10.19: 实时火烧云潜力预报（风云四号 / KMA 千里眼2A 双数据源 + 太阳扇区中高云识别 + 地图丝滑绘制）
+let _fcData=null,_fcLayer=null,_fcSrc='fy4';
+function switchFireSrc(src){
+  if(src===_fcSrc)return;
+  _fcSrc=src;
+  const box=$('fireCloudBox');if(box)box.innerHTML='<div class="obs-load">☁ 正在切换数据源分析太阳方向中高云…</div>';
+  loadFireCloud();
+}
 function loadFireCloud(){
   const box=$('fireCloudBox');if(!box)return;
   const lat=+$('lat').value,lon=+$('lon').value;
-  fetch('/api/fire-cloud?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  fetch('/api/fire-cloud?lat='+lat+'&lon='+lon+'&src='+_fcSrc,{cache:'no-store'}).then(r=>r.json()).then(j=>{
     if(!j.ok||!j.data)throw Error(j.error||'暂无数据');
     _fcData=j.data;
     box.innerHTML=renderFireCloud(j.data);
@@ -2771,7 +2882,8 @@ function renderFireCloud(d){
   const lv=d.level==='高'?'#e05a2b':d.level==='中'?'#c07f2a':d.level==='低'?'#8aa0b0':'#9aa8b5';
   const sun=d.sun,s=d.sector,t=new Date(d.time_bj);
   const pct=Math.max(0,Math.min(100,s.midhigh_rate));
-  let html='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">';
+  let html=`<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px"><span style="font-size:11px;color:var(--muted)">数据源</span><button onclick="switchFireSrc('fy4')" style="padding:5px 10px;font-size:11.5px;${d.src==='fy4'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">风云四号</button><button onclick="switchFireSrc('kma')" style="padding:5px 10px;font-size:11.5px;${d.src==='kma'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">KMA 千里眼2A</button></div>`;
+  html+='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">';
   html+=`<div style="min-width:96px;padding:12px 10px;border-radius:12px;background:linear-gradient(135deg,#fdf0e4,#f6dcc2);text-align:center"><div style="font-size:11px;color:#a06a1f">潜力评分</div><div style="font-size:26px;font-weight:800;color:${lv}">${d.score}</div><div style="font-size:11px;font-weight:700;color:${lv}">${d.level}</div></div>`;
   html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区中高云占比（卷云/高层云最易染红）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${pct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>中高云 <b>${s.midhigh_rate}%</b></span><span>总云量 ${s.cloud_rate}%</span><span style="color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</span></div></div></div>`;
   const rows=[
