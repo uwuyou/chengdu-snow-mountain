@@ -114,6 +114,15 @@ def clamp(x, lo=0.0, hi=1.0):
     return max(lo, min(hi, x))
 
 
+# v2.10.21: 观测坐标放开到中国及周边（不再限制在川渝）。
+# 依据风云四号红外云图覆盖范围(70-135°E / 10-55°N)取整，超出部分卫星/云图功能不可用但预报仍可出。
+GEO_LAT_MIN, GEO_LAT_MAX, GEO_LON_MIN, GEO_LON_MAX = 10.0, 55.0, 70.0, 135.0
+
+def _clamp_geo(lat, lon):
+    """将观测坐标钳制到中国及周边范围，并返回 (lat, lon)。"""
+    return clamp(lat, GEO_LAT_MIN, GEO_LAT_MAX), clamp(lon, GEO_LON_MIN, GEO_LON_MAX)
+
+
 def haversine_bearing(a_lat, a_lon, b_lat, b_lon):
     p1, p2 = map(math.radians, (a_lat, b_lat))
     dl = math.radians(b_lon - a_lon)
@@ -247,6 +256,54 @@ def path_terrain(observer, mountain, n=10):
     values[0]=float(observer["elev"]); values[-1]=float(mountain["elev"])
     cache_put(key,values)
     return values
+
+
+# v2.10.21: 峰顶地形遮挡判断——沿观测点到峰顶的高密度视线剖面，
+# 若中间任一点地形高于该处视线高度（含地球曲率+标准大气折射修正），则峰顶被山体遮挡、不可见。
+TERRAIN_OCC_N = 96              # 剖面采样点数（约每 1.2km 一个点，能捕捉山脊；过密会漏掉尖锐峰点）
+TERRAIN_OCC_MARGIN = 80.0       # 容差 m（树木/建筑/DEM 误差），低于视线不足 80m 视为擦边可见
+TERRAIN_OCC_RE = 6371008.8 * 7.0 / 6.0   # 等效地球半径 m（7/6R 折射，与前端剖面图一致）
+
+def _los_height_m(e0_m, e1_m, dist_m, d_m):
+    """观测点到峰顶的视线在距离 d 处的高度（含折射 bulge = d(D-d)/(2Re)）。"""
+    return e0_m + (e1_m - e0_m) * d_m / dist_m + d_m * (dist_m - d_m) / (2.0 * TERRAIN_OCC_RE)
+
+def terrain_occlusion(observer, mountain, n=TERRAIN_OCC_N):
+    """判断从观测点到峰顶的视线是否被中间地形遮挡。
+    返回 (blocked: bool, info: dict|None)；info 含遮挡最严重处距离/地形高度/视线高度/经纬度。"""
+    e0, e1 = float(observer["elev"]), float(mountain["elev"])
+    dist = haversine_bearing(observer["lat"], observer["lon"], mountain["lat"], mountain["lon"])[0]
+    if dist <= 1:
+        return False, None
+    points = interpolate_great_circle(observer["lat"], observer["lon"], mountain["lat"], mountain["lon"], n)
+    key = "path-terrain:" + ":".join(f"{a:.4f},{b:.4f}" for a, b in points)
+    cached, stale = cache_get_stale(key, 86400 * 30)
+    if cached is not None and not stale:
+        values = cached
+    else:
+        try:
+            values = open_meteo_elevations(points)
+        except Exception:
+            if cached is not None:
+                values = cached
+            else:
+                return False, None   # 地形数据不可用时保守放行，不误伤
+        values[0] = e0; values[-1] = e1
+        cache_put(key, values)
+    dist_m = dist * 1000.0
+    worst = None
+    for i in range(1, n - 1):
+        d_m = dist_m * i / (n - 1)
+        los = _los_height_m(e0, e1, dist_m, d_m)
+        t = float(values[i])
+        if t > los + TERRAIN_OCC_MARGIN:
+            over = t - los
+            if worst is None or over > worst["over"]:
+                worst = {"over": over, "distance": d_m / 1000.0, "terrain": t, "los": los,
+                         "lat": round(points[i][0], 5), "lon": round(points[i][1], 5)}
+    if worst is None:
+        return False, None
+    return True, worst
 
 
 def open_meteo_corridor(observer, mountains, days=5, model="best_match"):
@@ -971,15 +1028,14 @@ def _azimuth_diff(a, b):
     return d if d <= 180 else 360 - d
 
 # ---- v2.10.20: 火烧云"云底受光"几何判断 ----
-# 依据《火烧云定量预报速成(长三角适用)》第 1.2 节几何模型：
-#   坐标系：观测者为原点，x=水平球面距离(km)，h=海拔高度(km)，R=地球半径。
+# 几何模型（观测者为原点，x=水平球面距离(km)，h=海拔高度(km)，R=地球半径）：
 #   视线高度公式   h(x) = θ·x + x²/(2R)     （θ=视线仰角(弧度)，第一项为仰角上升，第二项为地球曲率修正）
 #   由上式反推云边界(云底)高度角：θ_edge = h_base/x - x/(2R)
-#   判断(图1.5/预报流程第3步)：只有太阳光线高度角 θ_sun 满足
+#   判断：只有太阳光线高度角 θ_sun 满足
 #       -x/(2R) < θ_sun < θ_edge
 #   时，阳光才能从云边界下方的空隙穿过、照射到云层下方照亮云底 → 真火烧云；
 #   否则云底在阴影中（光线高于云底=照云顶，低于地表=被地球遮挡）。
-FIRE_R = 6371.0                # 地球半径 km（与 PDF 一致）
+FIRE_R = 6371.0                # 地球半径 km
 FIRE_CLOUD_THICK_KM = 1.5      # 中高云平均厚度估计（云顶→云底，卫星只见云顶）
 
 def _cloud_top_km_fy4(g):
@@ -993,7 +1049,7 @@ def _cloud_top_km_kma(iv):
     return max(1.5, (15.0 - t) / 6.5)
 
 def _cloud_base_lit(sun_elev_deg, dist_km, h_top_km):
-    """PDF 几何模型：给定太阳高度角、云距离、云顶高度，判断云底能否被低角度阳光照亮。
+    """几何模型：给定太阳高度角、云距离、云顶高度，判断云底能否被低角度阳光照亮。
     返回 (受光bool, 云底高度km, 云边界高度角°)。"""
     if dist_km <= 0:
         return False, 0.0, 0.0
@@ -2239,7 +2295,16 @@ def build_forecast(observer, model="best_match"):
         # v2.10.5: 历史保留 profile（含视线走廊逐点云量/地形/温度等），供「早晚剖面图」渲染。
         # 此前 slim() 剥离 profile 导致历史卡片无法查看剖面。
         history = [{"date": d["date"], "morning": d["morning"], "evening": d["evening"]} for d in all_days if d["date"] < today]
-        result.append({**m,"distance":round(dist,1),"bearing":round(bearing,1),"peak_angle":round(apparent_peak_angle(dist,m["elev"],observer["elev"]),2),"daily":daily,"history":history})
+        # v2.10.21: 峰顶地形遮挡判断——被中间山体挡住则该山不参与预报展示，前端给出提示
+        occ_blocked, occ_info = terrain_occlusion(observer, m)
+        item = {**m, "distance": round(dist, 1), "bearing": round(bearing, 1),
+                "peak_angle": round(apparent_peak_angle(dist, m["elev"], observer["elev"]), 2),
+                "daily": daily, "history": history,
+                "terrain_blocked": occ_blocked}
+        if occ_blocked:
+            item["terrain_note"] = (f"视线被 {occ_info['distance']:.0f}km 处海拔 {occ_info['terrain']:.0f}m 的地形"
+                                    f"阻挡（该处视线高度仅 {occ_info['los']:.0f}m），峰顶被山体遮挡，当前观测点看不到该峰")
+        result.append(item)
     return {"observer":observer,"mountains":result,"weather_model":{"id":model,**WEATHER_MODELS[model]},"aerosol":{"status":"ready","message":"Open-Meteo CAMS Global · AOD550/PM2.5/沙尘 · 自动缓存1小时"},"warnings":warnings,"generated":datetime.now(TZ).isoformat(),"method":"所选天气模型 + Open-Meteo AOD550 + 通道云量/湿度/能见度 + v2.0 经验知识层（前夜大雨洗尘/霾层积累/观山季/日出窗口/连续晴日） + v2.8 天气系统层（850hPa 冷空气/锋面切变/槽脊/逆温层）"}
 
 
@@ -2253,10 +2318,10 @@ def api_forecast():
         lat=float(request.args.get("lat",DEFAULT_OBSERVER["lat"])); lon=float(request.args.get("lon",DEFAULT_OBSERVER["lon"]))
         model=request.args.get("model","best_match")
         if model not in WEATHER_MODELS: raise ValueError("不支持的天气数据源")
-        # v2.2: 坐标合法性校验 + 钳制到川渝及周边（拖拽出范围时不至于请求无意义区域）
+        # v2.2: 坐标合法性校验 + 放开到中国及周边（拖拽出范围时不至于请求无意义区域）
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("经纬度超出有效范围")
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         observer={"name":request.args.get("name","成都"),"lat":lat,"lon":lon,"elev":round(observer_elevation(lat,lon),1)}
         return jsonify({"ok":True,"data":build_forecast(observer,model)})
     except Exception as e:
@@ -2271,7 +2336,7 @@ def api_current():
         lat=float(request.args.get("lat",DEFAULT_OBSERVER["lat"])); lon=float(request.args.get("lon",DEFAULT_OBSERVER["lon"]))
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("经纬度超出有效范围")
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         observer={"name":request.args.get("name","成都"),"lat":lat,"lon":lon,"elev":round(observer_elevation(lat,lon),1)}
         om = current_weather_om(observer)
         cn = current_weather_cn(lat, lon)
@@ -2426,7 +2491,7 @@ def api_cloud_trend():
     try:
         lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
         lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         data = cloud_trend(lat, lon)
         if not data:
             return jsonify({"ok": False, "error": "云量趋势数据源暂不可用"}), 502
@@ -2441,7 +2506,7 @@ def api_cloud_map():
     try:
         lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
         lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         data = cloud_map_data(lat, lon)
         if not data:
             return jsonify({"ok": False, "error": "云图标注数据源暂不可用"}), 502
@@ -2458,7 +2523,7 @@ def api_history():
         start=request.args.get("start",""); end=request.args.get("end","")
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("经纬度超出有效范围")
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         s=datetime.strptime(start,"%Y-%m-%d").date(); e=datetime.strptime(end,"%Y-%m-%d").date()
         if s > e: s, e = e, s
         if (e - s).days > 90: raise ValueError("历史跨度最大 90 天")
@@ -2479,7 +2544,7 @@ def api_history_export():
         start=request.args.get("start",""); end=request.args.get("end","")
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             raise ValueError("经纬度超出有效范围")
-        lat = clamp(lat, 25.5, 34.5); lon = clamp(lon, 97.0, 110.0)
+        lat, lon = _clamp_geo(lat, lon)
         s=datetime.strptime(start,"%Y-%m-%d").date(); e=datetime.strptime(end,"%Y-%m-%d").date()
         if s > e: s, e = e, s
         if (e - s).days > 90: raise ValueError("历史跨度最大 90 天")
@@ -2596,8 +2661,9 @@ let liveMap=L.map('liveMap',{layers:[gaodeRoadLive]}).setView(_liveObs,9);
 const liveOm=L.marker(_liveObs,{icon:liveOmIcon,draggable:true,bubblingMouseEvents:false,autoPan:true}).addTo(liveMap).bindPopup('拖动我调整观测位置，松手自动刷新实况与云量趋势');
 liveOm.on('dragstart',()=>{liveOm._wasDrag=liveMap.dragging.enabled();liveMap.dragging.disable();liveOm.getElement().style.cursor='grabbing'});
 liveOm.on('drag',()=>{const g=liveOm.getLatLng();let la=g.lat,lo=g.lng,chg=false;
-if(la<25.5){la=25.5;chg=true}if(la>34.5){la=34.5;chg=true}
-if(lo<97){lo=97;chg=true}if(lo>110){lo=110;chg=true}
+// v2.10.21: 放开到中国及周边（风云四号云图覆盖范围），不再限制在川渝
+if(la<10){la=10;chg=true}if(la>55){la=55;chg=true}
+if(lo<70){lo=70;chg=true}if(lo>135){lo=135;chg=true}
 if(chg)liveOm.setLatLng([la,lo])});
 liveOm.on('dragend',()=>{liveOm.getElement().style.cursor='grab';if(liveOm._wasDrag)liveMap.dragging.enable();const g=liveOm.getLatLng(),w=gcjToWgs(g.lat,g.lng);$('lat').value=w[0].toFixed(6);$('lon').value=w[1].toFixed(6);$('name').value='地图拖拽点';$('elev').value='读取中';liveMap.closePopup();
 // 同步主地图观测点标记
@@ -2628,16 +2694,26 @@ const omIcon=L.divIcon({className:'',html:'<div style="width:22px;height:22px;bo
 const om=L.marker(og,{icon:omIcon,draggable:true,bubblingMouseEvents:false,autoPan:true}).addTo(map).bindPopup(`${o.name}<br>自动海拔 ${o.elev}m<br><small>拖动我调整观测位置，松手自动预测</small>`);
 om.on('dragstart',()=>{const was=map.dragging.enabled();window._dragMap=was;map.dragging.disable();om.getElement().style.cursor='grabbing'});
 om.on('drag',()=>{const g=om.getLatLng();let la=g.lat,lo=g.lng,chg=false;
-// v2.2: 钳制在川渝及周边，防止拖到无效区域导致预报失败
-if(la<25.5){la=25.5;chg=true}if(la>34.5){la=34.5;chg=true}
-if(lo<97){lo=97;chg=true}if(lo>110){lo=110;chg=true}
+// v2.10.21: 放开到中国及周边（风云四号云图覆盖范围），防止拖到无效区域导致预报失败
+if(la<10){la=10;chg=true}if(la>55){la=55;chg=true}
+if(lo<70){lo=70;chg=true}if(lo>135){lo=135;chg=true}
 if(chg)om.setLatLng([la,lo])});
 om.on('dragend',()=>{om.getElement().style.cursor='grab';if(window._dragMap)map.dragging.enable();const g=om.getLatLng(),w=gcjToWgs(g.lat,g.lng);$('lat').value=w[0].toFixed(6);$('lon').value=w[1].toFixed(6);$('name').value='地图拖拽点';$('elev').value='读取中';map.closePopup();window._dragFit=true;syncCloudMapOverlay();syncLiveOmFromMain();
 // v2.3: 防抖 1.2s——连续拖动只发一次预报，避免连点触发限流
 clearTimeout(_dragTimer);_dragTimer=setTimeout(()=>loadAll(),1200)});
 layers.push(om);window._mainOm=om;syncLiveOmFromMain();
-d.mountains.forEach(m=>{let mg=wgsToGcj(m.lat,m.lon);bounds.push(mg);layers.push(L.polyline([og,mg],{color:'#8ba3b5',weight:1.8,dashArray:'6 7'}).addTo(map));layers.push(L.circleMarker(mg,{radius:7,color:'#8a6d3b',weight:1.5,fillColor:'#b8964e',fillOpacity:.9}).addTo(map).bindPopup(`${m.name}<br>${m.elev}m · ${m.distance}km`))});if(window._dragFit){window._dragFit=false}else{map.fitBounds(bounds,{padding:[25,25]})}paintBlocked();drawHistory(d);drawTrend(d);
-$('cards').innerHTML=d.mountains.map((m,mi)=>`<section class="panel mountain"><h3>${m.name}</h3><div class="meta">${m.distance} km · 方位 ${m.bearing}° · 峰顶仰角约 ${m.peak_angle}°</div><div class="days">${m.daily.map((x,di)=>{let b=x.morning;return `<div class="day"><strong>${x.date.slice(5)}</strong><div class="score" style="color:${color(b.score)}">${b.score}</div><div class="bar"><i style="width:${b.score}%"></i></div><div class="tabs"><span>晨 ${fmtTime(b.time)}</span><span>晚 ${x.evening.score}</span></div><div class="metrics"><span>AOD550 <b>${b.aod==null?'暂无':b.aod.toFixed(2)}</b></span><span>低云 <b>${b.low}%</b></span><span>能见 <b>${b.visibility}km</b></span><span>湿度 <b>${b.rh}%</b></span></div><div class="small">金山最高 ${x.gold.gold} 分<br><span class="emp-chip">经验 ${b.empirical_bonus>=0?'+':''}${b.empirical_bonus} · 洗尘+${b.empirical.washout} 霾−${b.empirical.haze} 季${b.empirical.season>=0?'+':''}${b.empirical.season} 窗+${b.empirical.window} 晴+${b.empirical.clear}</span>${synTags(b.synoptic)}${fogTag(b.fog)}<br>${b.reasons.join('、')}</div><div class="sim-actions"><button onclick="openSimulation(${mi},${di},'morning')">晨间形态</button><button onclick="openSimulation(${mi},${di},'evening')">傍晚形态</button></div></div>`}).join('')}</div></section>`).join('')}
+d.mountains.forEach(m=>{let mg=wgsToGcj(m.lat,m.lon);bounds.push(mg);
+if(m.terrain_blocked){
+  // v2.10.21: 地形遮挡——灰显虚线 + 遮挡提示弹窗，不展示该山预测
+  layers.push(L.polyline([og,mg],{color:'#c9ccd1',weight:1.2,dashArray:'2 7',interactive:false}).addTo(map));
+  layers.push(L.circleMarker(mg,{radius:6,color:'#9aa0a6',weight:1.5,fillColor:'#c0c4c8',fillOpacity:.75}).addTo(map).bindPopup(`${m.name}<br>${m.elev}m · ${m.distance}km<br><b style="color:#c25548">地形遮挡</b>：${m.terrain_note||'峰顶被中间山体遮挡'}`));
+}else{
+  layers.push(L.polyline([og,mg],{color:'#8ba3b5',weight:1.8,dashArray:'6 7'}).addTo(map));
+  layers.push(L.circleMarker(mg,{radius:7,color:'#8a6d3b',weight:1.5,fillColor:'#b8964e',fillOpacity:.9}).addTo(map).bindPopup(`${m.name}<br>${m.elev}m · ${m.distance}km`));
+}});if(window._dragFit){window._dragFit=false}else{map.fitBounds(bounds,{padding:[25,25]})}paintBlocked();drawHistory(d);drawTrend(d);
+$('cards').innerHTML=d.mountains.map((m,mi)=>m.terrain_blocked?
+`<section class="panel mountain"><h3>${m.name} <span class="tag2" style="background:#c25548;color:#fff">地形遮挡</span></h3><div class="meta">${m.distance} km · 方位 ${m.bearing}° · 峰顶仰角约 ${m.peak_angle}°</div><div class="hist-note" style="color:#c25548;margin-top:8px">⛰ ${m.terrain_note||'峰顶被中间山体遮挡'}。已取消显示该山预测。</div></section>`
+:`<section class="panel mountain"><h3>${m.name}</h3><div class="meta">${m.distance} km · 方位 ${m.bearing}° · 峰顶仰角约 ${m.peak_angle}°</div><div class="days">${m.daily.map((x,di)=>{let b=x.morning;return `<div class="day"><strong>${x.date.slice(5)}</strong><div class="score" style="color:${color(b.score)}">${b.score}</div><div class="bar"><i style="width:${b.score}%"></i></div><div class="tabs"><span>晨 ${fmtTime(b.time)}</span><span>晚 ${x.evening.score}</span></div><div class="metrics"><span>AOD550 <b>${b.aod==null?'暂无':b.aod.toFixed(2)}</b></span><span>低云 <b>${b.low}%</b></span><span>能见 <b>${b.visibility}km</b></span><span>湿度 <b>${b.rh}%</b></span></div><div class="small">金山最高 ${x.gold.gold} 分<br><span class="emp-chip">经验 ${b.empirical_bonus>=0?'+':''}${b.empirical_bonus} · 洗尘+${b.empirical.washout} 霾−${b.empirical.haze} 季${b.empirical.season>=0?'+':''}${b.empirical.season} 窗+${b.empirical.window} 晴+${b.empirical.clear}</span>${synTags(b.synoptic)}${fogTag(b.fog)}<br>${b.reasons.join('、')}</div><div class="sim-actions"><button onclick="openSimulation(${mi},${di},'morning')">晨间形态</button><button onclick="openSimulation(${mi},${di},'evening')">傍晚形态</button></div></div>`}).join('')}</div></section>`).join('')}
 
 // v2.10: 板块整合——天气预报(fc)/实况观测(live)/观山知识(kb)
 function switchTab(t){document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));document.querySelectorAll('.tab-pane').forEach(p=>p.classList.toggle('active',p.id==='pane-'+t));if(t==='fc'){setTimeout(()=>map.invalidateSize(),60)}else if(t==='hist'){setTimeout(()=>{if(lastData){drawTrend(lastData);drawHistory(lastData)}},60)}else if(t==='live'){setTimeout(()=>{liveMap.invalidateSize();const _g=wgsToGcj(+$('lat').value,+$('lon').value);liveMap.setView(_g,Math.max(liveMap.getZoom(),9));const im=document.querySelector('.sat-wrap img');if(im&&im.complete&&im.naturalWidth)zoomSat(im);const cv=$('satOverlay');if(cv&&cv.width>10)drawCloudOverlay();loadFy4Cloud()},60)}else if(t==='windy'){renderWindy()}else if(t==='wm'){setTimeout(()=>{wmInit()},60)}}
@@ -2739,7 +2815,7 @@ function drawHistory(d){
   const any=d.mountains.some(m=>m.history&&m.history.length);
   if(!any){box.innerHTML='<div class="hist-note">暂无历史数据（需要过去 7 天的天气再分析数据，可能因数据源限制暂缺）。</div>';return}
   let html='<div class="hist-note">过去 7 天 · <b style="color:var(--gold)">历史回算</b>（ERA5 再分析数据，非预报，可对照当天实际天气验证「雨后洗尘」等经验规律）。点击日期可展开当日明细；也可在下方选择任意日期范围查询。</div>';
-  html+=renderHistDays(d.mountains.map(m=>({name:m.name,daily:m.history.map(h=>({date:h.date,morning:h.morning,evening:h.evening}))})));
+  html+=renderHistDays(d.mountains.filter(m=>!m.terrain_blocked).map(m=>({name:m.name,daily:m.history.map(h=>({date:h.date,morning:h.morning,evening:h.evening}))})));
   box.innerHTML=html;
 }
 // v2.6: 任意日期范围查询
@@ -2759,7 +2835,7 @@ async function queryHistory(){
     let warn='';
     if(!d.aod_available)warn='<div class="hist-note" style="color:var(--gold)">⚠ 该时段超过气溶胶数据范围（近 92 天），AOD 评分项已自动降级，仍可参考云量/能见度结果。</div>';
     const head=`<div class="hist-note">${d.span.start} ~ ${d.span.end} · ${d.observer.name} · <b style="color:var(--gold)">历史回算</b>（ERA5 再分析，非预报）· 点击日期展开明细</div>`;
-    const grid=renderHistDays(d.mountains.map(m=>({name:m.name,daily:m.daily})));
+    const grid=renderHistDays(d.mountains.filter(m=>!m.terrain_blocked).map(m=>({name:m.name,daily:m.daily})));
     box.innerHTML=warn+head+grid;
   }catch(err){box.innerHTML='<div class="hist-note" style="color:var(--red)">查询失败：'+err.message+'</div>'}
 }
@@ -3211,6 +3287,7 @@ function loadCloudTrend(){
    else if(fcLen){c.font='bold 11px sans-serif';c.textAlign='center';c.fillStyle='#b07a2a';c.fillText('预报',PL+cw/2,PT+13)}
    // 折线（v2.10.1: 回算=实线+实心点；预报=虚线+空心点）
    d.mountains.forEach((m,mi)=>{
+     if(m.terrain_blocked)return;  // v2.10.21: 地形遮挡的山不参与趋势展示
      const col=TREND_COLORS[mi%TREND_COLORS.length];
      const histPts=[],fcPts=[];
      (m.history||[]).forEach((h,i)=>{histPts.push({x:X(i),y:Y(h.morning.score),v:h.morning.score,date:h.date})});
