@@ -1545,15 +1545,15 @@ def fy4_cloud_analysis(lat, lon, now=None):
         }
         t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
         t_bj = t_utc.astimezone(TZ)
-        # 3) 云顶高度分层：Open-Meteo 当前时次低/中/高云量（近似）
+        # 3) 云顶高度分层：Open-Meteo 当前时次低/中/高云量（辅助展示，非核心评分）。
+        # v3.x: 统走 http_get_json 以受进程中令牌桶限流+退避约束，避免裸请求累积 429。
         top = None
         try:
-            om = SESSION.get("https://api.open-meteo.com/v1/forecast", params={
+            om = http_get_json("https://api.open-meteo.com/v1/forecast", params={
                 "latitude": lat, "longitude": lon,
                 "current": "cloud_cover_low,cloud_cover_mid,cloud_cover_high",
             }, timeout=20)
-            om.raise_for_status()
-            c = om.json().get("current") or {}
+            c = om.get("current") or {}
             top = {"low": c.get("cloud_cover_low"), "mid": c.get("cloud_cover_mid"),
                    "high": c.get("cloud_cover_high")}
         except Exception as e:
@@ -3166,19 +3166,49 @@ def score_hour(dt, mountain, corridor, observer, air, terrain, syn=None):
     return {"time":dt.isoformat(),"score":score,"gold":gold,"empirical":empirical,"empirical_bonus":round(empirical_bonus,1),"synoptic":syn_facts,"synoptic_bonus":round(syn_bonus,1),"fog":None if fog_level is None else {"level":fog_level,"penalty":fog_penalty},"aod":None if aod is None else round(aod,3),"pm2_5":None if air.get("pm2_5") is None else round(air["pm2_5"],1),"dust":None if air.get("dust") is None else round(air["dust"],1),"low":round(max(low),1),"mid":round(max(mid[3:]),1),"high":round(sum(high)/len(high),1),"visibility":round(min(vis[:3])/1000,1),"rh":round(max(rh[:3]),1),"sun_elev":round(elev,1),"profile":profile,"blocked":blocked,"reasons":reasons or ["云量与通透度较好"]}
 
 
+def _empty_corridor():
+    """构造全部走廊点为空的 meteo 结构（time 空），供数据源全挂时兜底，避免整接口 500。"""
+    rec = {"time": [], "cloud_cover": [], "cloud_cover_low": [], "cloud_cover_mid": [],
+           "cloud_cover_high": [], "visibility": [], "relative_humidity_2m": [],
+           "precipitation_probability": [], "precipitation": [], "wind_speed_10m": [],
+           "temperature_2m": []}
+    return {m["id"]: [dict(rec) for _ in range(10)] for m in MOUNTAINS}
+
+
+def _corridor_ok(meteo):
+    return bool(meteo) and all(any(p.get("time") for p in meteo[m["id"]]) for m in MOUNTAINS)
+
+
 def _forecast_weather(observer, model="best_match", use_gfs=True):
     """天气源路由：优先直达 GFS 数值预报，失败自动回退 Open-Meteo。
     返回 (weather_from, meteo, meteo_stale)。weather_from in {"gfs","openmeteo"}。
-    只在 build_forecast（预报）与 export_history_xlsx（预报段）两个入口接入直取，
+    v3.x: GFS 结果缓存 30min（GFS 每 6h 更新），避免每次冷下载 GFS 慢→超时→回退
+    Open-Meteo→429；数据源全部不可用时返回空走廊结构而非抛 500。
+    只在 build_forecast（预报）与 export_history_xlsx（预报段）接入直取，
     历史回算仍走 ERA5 再分析（无分层的连续同化，直取不适用）。"""
+    fkey = f"gfsmeteo:{observer['lat']:.3f},{observer['lon']:.3f}"
     if use_gfs:
-        try:
-            meteo = gfs_corridor_weather(observer, MOUNTAINS)
-            if meteo and all(any(p.get("time") for p in meteo[m["id"]]) for m in MOUNTAINS):
-                return "gfs", meteo, False
-        except Exception:
-            pass
-    return "openmeteo", *open_meteo_corridor(observer, MOUNTAINS, model=model)
+        meteo = cache_get(fkey, 1800)
+        if meteo is None:
+            try:
+                meteo = gfs_corridor_weather(observer, MOUNTAINS)
+                cache_put(fkey, meteo)
+            except Exception:
+                meteo, _ = cache_get_stale(fkey, 24 * 3600)
+        if _corridor_ok(meteo):
+            return "gfs", meteo, False
+    # GFS 不可用：回退 Open-Meteo；仍失败则回退 GFS 过期缓存。
+    try:
+        om, om_stale = open_meteo_corridor(observer, MOUNTAINS, model=model)
+        if _corridor_ok(om):
+            return "openmeteo", om, om_stale
+    except Exception:
+        om_stale = False
+    if use_gfs:
+        stale_m, _ = cache_get_stale(fkey, 24 * 3600)
+        if _corridor_ok(stale_m):
+            return "gfs", stale_m, True
+    return "openmeteo", _empty_corridor(), False
 
 
 def build_forecast(observer, model="best_match"):
