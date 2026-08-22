@@ -284,7 +284,10 @@ def path_terrain(observer, mountain, n=10):
     except Exception:
         # v2.3: 海拔接口繁忙时用过期地形兜底（地形基本不变，安全）
         if cached is not None: return cached
-        raise
+        # v3.x: 地形服务不可用且无缓存时，用观测点→峰顶线性插值降级，
+        # 保证预报不因 Open-Meteo 429/403 而整体失败（无真实山脊，仅几何近似，不缓存）。
+        _e0 = float(observer["elev"]); _e1 = float(mountain["elev"]); _n = len(points)
+        return [_e0 + (_e1 - _e0) * i / (_n - 1 if _n > 1 else 1) for i in range(_n)]
     # 端点使用已知观测点/峰顶高程，避免90m DEM格点把尖锐峰顶平滑掉。
     values[0]=float(observer["elev"]); values[-1]=float(mountain["elev"])
     cache_put(key,values)
