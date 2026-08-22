@@ -400,6 +400,156 @@ def open_meteo_aerosol(observer, mountains, days=5):
     return result, False
 
 
+# ---- v3.x: CAMS 气溶胶直连（Copernicus ADS，替代 Open-Meteo 代理） ----
+# ADS 目标：杜绝三方汇聚延迟/限流，直接取 CAMS 全球成分预报的 AOD550 沿走廊采样。
+# 注意：ADS 为同步排队式检索，首次可能几十秒～几分钟，故 cache TTL 拉长到 3h，
+# 且失败自动回退 Open-Meteo（评分降级，不阻塞）。
+# Key 从环境变量 ADS_KEY 读取，缺省回落用户配置（见下方）。
+_CAMS_ADS_KEY = os.environ.get("ADS_KEY") or os.environ.get("CAMS_KEY") or "87b71860-7f54-4eab-9b24-a3f1beb2abb0"
+_CAMS_ADS_DATASET = "cams-global-atmospheric-composition-forecasts"
+_CAMS_ADS_URL = "https://ads.atmosphere.copernicus.eu/api"
+
+
+def _cams_ads_client():
+    """构造 cdsapi Client（写入 ~/.cdsapirc 一次）。返回 (client, 引用日期, 周期)。"""
+    import cdsapi
+    home = os.path.expanduser("~")
+    if not os.path.isdir(home):
+        home = "/tmp"
+    cfg = os.path.join(home, ".cdsapirc")
+    if not os.path.exists(cfg):
+        with open(cfg, "w") as f:
+            f.write(f"url: {_CAMS_ADS_URL}\nkey: {_CAMS_ADS_KEY}\n")
+        try:
+            os.chmod(cfg, 0o600)
+        except Exception:
+            pass
+    return cdsapi.Client()
+
+
+def cams_ads_aerosol(observer, mountains, days=5, step_h=3):
+    """直达 CAMS（Copernicus ADS）的总 AOD550，沿每座山视线 10 个走廊点采样。
+    返回与 open_meteo_aerosol 相同结构：{山id: [hourly, ...10点]}，每点含
+    time/aerosol_optical_depth/pm2_5/dust（pm2_5、dust 置 None，主评分只用 aod）。
+    任一步骤失败抛异常，由上层回退 Open-Meteo。"""
+    try:
+        import xarray as xr  # noqa: F401
+    except Exception:
+        raise RuntimeError("CAMS 解析依赖 xarray，回退 Open-Meteo")
+    points, owners = [], []
+    for m in mountains:
+        for lat, lon in interpolate_great_circle(observer["lat"], observer["lon"], m["lat"], m["lon"], 10):
+            points.append((lat, lon)); owners.append(m["id"])
+    lats = [p[0] for p in points]; lons = [p[1] for p in points]
+    pad = 0.4
+    clat0, clat1 = max(-90, min(lats) - pad), min(90, max(lats) + pad)
+    clon0, clon1 = max(-180, min(lons) - pad), min(180, max(lons) + pad)
+    # CAMS 00Z/12Z 周期：就近取已发布且能覆盖预报窗口的 run。UTC 至今 06 点后当天 00Z 已发布。
+    now_utc = datetime.now(timezone.utc)
+    ref_date = now_utc.strftime("%Y-%m-%d")
+    # leadtime（小时）覆盖 days 天、step_h 步长
+    hrs = sorted({h for h in range(0, days * 24 + 1, step_h)})
+    req = {
+        "variable": ["total_aerosol_optical_depth_550nm"],
+        "date": ref_date,
+        "type": "forecast",
+        "time": "00:00",
+        "leadtime_hour": [str(h) for h in hrs],
+        "area": [clat1, clon0, clat0, clon1],   # N, W, S, E
+        "data_format": "netcdf_zip",
+    }
+    key = _CAMS_ADS_KEY
+    tmp_zip = f"/tmp/cams_ads_{id(observer)}_{int(time.time())}.zip"
+    client = _cams_ads_client()
+    try:
+        out = client.retrieve(_CAMS_ADS_DATASET, req, tmp_zip)
+        if isinstance(out, str):
+            tmp_zip = out
+        elif hasattr(out, "__iter__"):
+            tmp_zip = list(out)[0]
+    except Exception as e:
+        try: os.remove(tmp_zip)
+        except Exception: pass
+        raise RuntimeError(f"CAMS ADS 检索失败({type(e).__name__}): {str(e)[:120]}，回退 Open-Meteo")
+
+    # cdsapi netcdf_zip 返回 zip，内含 data_sfc.nc
+    import zipfile
+    nc_path = None
+    os.makedirs("/tmp/cams_ads", exist_ok=True)
+    try:
+        with zipfile.ZipFile(tmp_zip) as z:
+            members = [n for n in z.namelist() if n.lower().endswith(".nc")]
+            if not members:
+                raise RuntimeError("CAMS zip 内无 netcdf 文件")
+            nc_path = os.path.join("/tmp/cams_ads", f"ads_{int(time.time())}_{os.path.basename(os.path.dirname(members[0])) or 'data'}.nc")
+            with z.open(members[0]) as src, open(nc_path, "wb") as dst:
+                import shutil; shutil.copyfileobj(src, dst)
+    except RuntimeError:
+        os.remove(tmp_zip)
+        raise
+    try: os.remove(tmp_zip)
+    except Exception: pass
+
+    try:
+        ds = xr.open_dataset(nc_path, decode_times=False)
+        aod = ds["aod550"].values          # (forecast_period, 1, lat, lon)
+        latv = np.asarray(ds["latitude"].values, dtype=float)
+        lonv = np.asarray(ds["longitude"].values, dtype=float)
+        if "forecast_period" in ds.coords:
+            fper = np.asarray(ds["forecast_period"].values, dtype=float)
+        else:
+            fper = None
+        valid_unix = None
+        if "valid_time" in ds.coords:
+            try:
+                valid_unix = np.asarray(ds["valid_time"].values, dtype=float)  # period×1
+            except Exception:
+                valid_unix = None
+        ref_unix = None
+        if "forecast_reference_time" in ds.coords:
+            try:
+                ref_unix = float(np.asarray(ds["forecast_reference_time"].values, dtype=float).min())
+            except Exception:
+                ref_unix = None
+        ds.close()
+    finally:
+        try: os.remove(nc_path)
+        except Exception: pass
+
+    if aod.ndim < 3:
+        raise RuntimeError("CAMS AOD 维度异常，回退 Open-Meteo")
+    nf = aod.shape[0]
+    # determinist grid index per point
+    idx = [int(np.argmin(np.abs(latv - p[0]))) for p in points]
+    jdx = [int(np.argmin(np.abs(lonv - p[1]))) for p in points]
+    # valid time array (unix) per period
+    if valid_unix is not None and valid_unix.ndim >= 1 and len(valid_unix) >= nf:
+        unix_per = valid_unix[:, 0] if valid_unix.ndim >= 2 else valid_unix
+        unix_per = np.asarray(unix_per, dtype=float)
+    elif ref_unix is not None and fper is not None and len(fper) >= nf:
+        unix_per = ref_unix + np.asarray(fper, dtype=float) * 3600.0
+    else:
+        unix_per = None
+
+    result = {m["id"]: [{"time": [], "aerosol_optical_depth": [], "pm2_5": [],
+                         "dust": []} for _ in range(10)] for m in mountains}
+    for k in range(nf):
+        if unix_per is not None:
+            tstr = datetime.fromtimestamp(unix_per[k], TZ).strftime("%Y-%m-%dT%H:%M")
+        else:
+            tstr = ""
+        for pi, (ob, i, j) in enumerate(zip(owners, idx, jdx)):
+            # aod shape (period, dim1, lat, lon) → 取最近的 forecast 层
+            v = float(aod[k, 0, i, j])
+            v = None if v != v else v
+            rec = result[ob][pi % 10]
+            rec["time"].append(tstr)
+            rec["aerosol_optical_depth"].append(v)
+            rec["pm2_5"].append(None)
+            rec["dust"].append(None)
+    return result
+
+
 # ---- v2.6 历史任意时段（Open-Meteo Archive · ERA5 再分析，1940 年至今） ----
 
 def open_meteo_archive(observer, mountains, start_date, end_date):
@@ -470,6 +620,386 @@ def open_meteo_aerosol_history(observer, mountains, start_date, end_date):
 
 
 EMPTY_AIR = {"aod": None, "pm2_5": None, "dust": None, "points": []}
+
+
+# ---- v3.x 直达 GFS 数值预报（NOAA NOMADS 0.25°，替代 Open-Meteo 天气源） ----
+# 直接从美国国家环境预报中心 NOMADS 拉取 GFS 全球 0.25° GRIB2，解析走廊视线上的
+# 地面气温/相对湿度/总云量/垂直分层云量/能见度/降水率/10m 风，替代 Open-Meteo 天气。
+# 优点：真正的"数值预报直取"，数据更原始、无三方汇聚延迟；失败时自动回退 Open-Meteo。
+
+_GFS_FILTER = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+_GFS_CYCLES = [0, 6, 12, 18]
+_GFS_LOW_LEVELS = (1000.0, 975.0, 950.0, 925.0, 900.0, 850.0)   # 近地面层 → 低云
+_GFS_MID_LEVELS = (800.0, 700.0, 600.0)                          # 对流层中层 → 中云
+_GFS_HIGH_LEVELS = (500.0, 400.0, 300.0, 250.0, 200.0)           # 高层 → 高云
+
+
+def _rh_to_cloud_fraction(rh):
+    """用各气压层的相对湿度估算该层云量（0-100）。
+    经验映射：<=62% 无云，100% 密云，线性过渡（GFS 缺 CV 层云量时的替代）。"""
+    if rh is None:
+        return 0.0
+    try:
+        rh = float(rh)
+    except (TypeError, ValueError):
+        return 0.0
+    return clamp((rh - 62.0) / 38.0, 0.0, 1.0) * 100.0
+
+
+def _layer_cloud(pres, rvals, levels, i, j):
+    """从 GFS 等压面相对湿度（已预载入内存）估算指定层云量（%），采样网格点 (i,j)。"""
+    if pres is None or rvals is None:
+        return None
+    vals = []
+    for target in levels:
+        k = int(np.argmin(np.abs(pres - target)))
+        try:
+            v = float(rvals[k, i, j])
+            if v == v:
+                vals.append(v)
+        except Exception:
+            continue
+    return _rh_to_cloud_fraction(max(vals) if vals else None)
+
+
+def _gfs_latest_run():
+    """探测最近可用的 GFS 运行（日期 + 周期）。返回 (yyyymmdd, 周期) 或 None。"""
+    today = datetime.now(timezone.utc)
+    cands = []
+    for back in range(3):
+        d = today - timedelta(days=back)
+        dstr = d.strftime("%Y%m%d")
+        # 今天只看已过或即将到的周期；往前看完整 6 小时周期
+        now_h = d.hour + d.minute / 60.0
+        for cyc in sorted(_GFS_CYCLES, reverse=True):
+            if back == 0 and cyc > now_h + 6:
+                continue
+            cands.append((dstr, cyc))
+    for dstr, cyc in cands:
+        try:
+            r = SESSION.get(_GFS_FILTER, params={
+                "file": f"gfs.t{cyc:02d}z.pgrb2.0p25.f003",
+                "dir": f"/gfs.{dstr}/{cyc:02d}/atmos",
+                "subregion": "", "var_TMP": "on",
+                "lev_2_m_above_ground": "on",
+                "toplat": "35", "bottomlat": "25", "leftlon": "100", "rightlon": "110",
+            }, timeout=25)
+            if r.status_code == 200 and r.content[:6] != b"<!doct":
+                return dstr, cyc
+        except Exception:
+            continue
+    return None
+
+
+def gfs_corridor_weather(observer, mountains, days=5, step_h=3):
+    """直达 GFS 数值预报的走廊天气。
+    返回与 open_meteo_corridor 相同结构：{山id: [hourly, ...10个走廊点]}，每点含
+    time/cloud_cover/cloud_cover_low|mid|high/visibility/relative_humidity_2m/
+    precipitation_probability/precipitation/wind_speed_10m/temperature_2m。
+    任一步骤失败抛异常，由上层回退 Open-Meteo。"""
+    try:
+        import cfgrib  # noqa: F401  确保环境可用
+    except Exception:
+        raise RuntimeError("GFS 解析依赖 cfgrib 未安装，回退 Open-Meteo")
+    points, owners = [], []
+    for m in mountains:
+        for lat, lon in interpolate_great_circle(observer["lat"], observer["lon"], m["lat"], m["lon"], 10):
+            points.append((lat, lon)); owners.append(m["id"])
+    run = _gfs_latest_run()
+    if run is None:
+        raise RuntimeError("NOMADS 无可用 GFS 运行，回退 Open-Meteo")
+    dstr, cyc = run
+    # 走廊包围盒（外扩 1°，钳制到 GFS 全球边界）
+    lats = [p[0] for p in points]; lons = [p[1] for p in points]
+    lat0, lat1 = max(-89.75, min(lats) - 1.0), min(89.75, max(lats) + 1.0)
+    lon0, lon1 = max(-179.75, min(lons) - 1.0), min(179.75, max(lons) + 1.0)
+    # GFS 0.25° 均匀网格：从下边界算行列偏移最稳
+    from concurrent.futures import ThreadPoolExecutor
+    hours = list(range(0, days * 24 + 1, step_h))
+    params_spec = [
+        ("var_TMP", "lev_2_m_above_ground"), ("var_RH", "lev_2_m_above_ground"),
+        ("var_UGRD", "lev_10_m_above_ground"), ("var_VGRD", "lev_10_m_above_ground"),
+        ("var_TCDC", "lev_entire_atmosphere"),
+        ("var_VIS", "lev_surface"), ("var_PRATE", "lev_surface"),
+    ]
+
+    def _download(h):
+        p = {"file": f"gfs.t{cyc:02d}z.pgrb2.0p25.f{h:03d}", "dir": f"/gfs.{dstr}/{cyc:02d}/atmos",
+             "subregion": "", "toplat": f"{lat1:.2f}", "bottomlat": f"{lat0:.2f}",
+             "leftlon": f"{lon0:.2f}", "rightlon": f"{lon1:.2f}"}
+        for var, lev in params_spec:
+            p[var] = "on"; p[lev] = "on"
+        for mb in ["1000", "975", "950", "925", "900", "850", "800", "700", "600", "500", "400", "300", "250", "200"]:
+            p[f"lev_{mb}_mb"] = "on"
+        return h, SESSION.get(_GFS_FILTER, params=p, timeout=40)
+
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for h, resp in ex.map(_download, hours):
+            if resp.status_code == 200 and resp.content[:6] != b"<!doct":
+                fetched[h] = resp.content
+    if not fetched:
+        raise RuntimeError("GFS 数据下载全部失败，回退 Open-Meteo")
+
+    run_start = datetime(int(dstr[:4]), int(dstr[4:6]), int(dstr[6:8]), cyc, 0, tzinfo=timezone.utc)
+    result = {m["id"]: [{"time": [], "cloud_cover": [], "cloud_cover_low": [], "cloud_cover_mid": [],
+                         "cloud_cover_high": [], "visibility": [], "relative_humidity_2m": [],
+                         "precipitation_probability": [], "precipitation": [], "wind_speed_10m": [],
+                         "temperature_2m": []} for _ in range(10)] for m in mountains}
+
+    def _parse(h, content):
+        # cfgrib 只接受真实文件路径，写临时文件再解析
+        tmp = f"/tmp/gfs_csm_{h}_{id(content)}.grib2"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        try:
+            dss = cfgrib.open_datasets(tmp, backend_kwargs={"errors": "ignore"})
+        except Exception:
+            try: os.remove(tmp)
+            except Exception: pass
+            return h, None
+        # GFS 各变量按 typeOfLevel 被拆到不同 xarray 数据集（2m/10m/surface/entire_atmosphere），
+        # 这里把所有 2D 平面字段按变量名合并，供逐点最近采样；等压面 RH 预载入内存算层云
+        # （文件随后删除，xarray 懒加载句柄不可复用）。
+        fields, iso_pres, iso_r = {}, None, None
+        for ds in dss:
+            if "isobaricInhPa" in ds.coords:
+                if iso_pres is None and "r" in ds.data_vars and "t" in ds.data_vars:
+                    iso_pres = np.asarray(ds["isobaricInhPa"].values, dtype=float)
+                    iso_r = np.asarray(ds["r"].values, dtype=float)
+                continue
+            latv = ds["latitude"].values
+            lonv = ds["longitude"].values
+            ni, nj = len(latv), len(lonv)
+            for name in ds.data_vars:
+                try:
+                    a = ds[name].values
+                    if a.ndim == 2 and a.shape == (ni, nj) and name not in fields:
+                        fields[name] = a
+                except Exception:
+                    continue
+        try: os.remove(tmp)
+        except Exception: pass
+        if not fields and iso_r is None:
+            return h, None
+        return h, (fields, (iso_pres, iso_r))
+
+    parsed = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for h, pi in ex.map(lambda hc: _parse(hc[0], hc[1]), fetched.items()):
+            parsed[h] = pi
+    parsed = {h: pi for h, pi in parsed.items() if pi is not None}
+    if not parsed:
+        raise RuntimeError("GFS 解析失败，回退 Open-Meteo")
+
+    for h, (fields, (iso_pres, iso_r)) in sorted(parsed.items()):
+        valid = run_start + timedelta(hours=h)
+        tstr = valid.astimezone(TZ).strftime("%Y-%m-%dT%H:%M")
+        # 确定性网格索引：逐点最近取整（GFS 为 0.25° 均匀网格，lat 自南向北递增）
+        dlat = 0.25; dlon = 0.25
+        # 由任一字段推断网格尺寸；若缺字段存在但该时次缺失则跳过该走廊点
+        if "t2m" in fields:
+            ni, nj = fields["t2m"].shape
+        elif "tcc" in fields:
+            ni, nj = fields["tcc"].shape
+        else:
+            continue
+        for pi, (lat, lon) in enumerate(points):
+            i = int(round((lat - lat0) / dlat)); j = int(round((lon - lon0) / dlon))
+            i = max(0, min(ni - 1, i)); j = max(0, min(nj - 1, j))
+            def gv(name, default=None):
+                a = fields.get(name)
+                if a is None:
+                    return default
+                try:
+                    v = float(a[i, j])
+                    return default if v != v else v
+                except Exception:
+                    return default
+            t2m = gv("t2m"); rh = gv("r2"); tcc = gv("tcc")
+            vis = gv("vis"); prate = gv("prate")
+            u10 = gv("u10"); v10 = gv("v10")
+            low = _layer_cloud(iso_pres, iso_r, _GFS_LOW_LEVELS, i, j)
+            mid = _layer_cloud(iso_pres, iso_r, _GFS_MID_LEVELS, i, j)
+            high = _layer_cloud(iso_pres, iso_r, _GFS_HIGH_LEVELS, i, j)
+            rec = result[owners[pi]][pi % 10]  # 每山 10 个走廊点按顺序
+            rec["time"].append(tstr)
+            rec["cloud_cover"].append(0.0 if tcc is None else tcc)
+            rec["cloud_cover_low"].append(0.0 if low is None else low)
+            rec["cloud_cover_mid"].append(0.0 if mid is None else mid)
+            rec["cloud_cover_high"].append(0.0 if high is None else high)
+            rec["visibility"].append(None if vis is None else vis)
+            rec["relative_humidity_2m"].append(70.0 if rh is None else rh)
+            mmh = None if prate is None else round(prate * 3600.0, 2)  # kg/m²/s → mm/h
+            rec["precipitation"].append(mmh)
+            rec["precipitation_probability"].append(0.0 if mmh is None else min(100.0, round(mmh * 25)))
+            rec["wind_speed_10m"].append(0.0 if u10 is None or v10 is None else round(math.hypot(u10, v10), 1))
+            rec["temperature_2m"].append(15.0 if t2m is None else round(t2m - 273.15, 1))
+    # 丢弃任何完全没有取到数据的山（极少数情况），避免下游 KeyError
+    for m in mountains:
+        if all(not rec["time"] for rec in result[m["id"]]):
+            result[m["id"]] = [{"time": [], "cloud_cover": [], "cloud_cover_low": [],
+                                "cloud_cover_mid": [], "cloud_cover_high": [], "visibility": [],
+                                "relative_humidity_2m": [], "precipitation_probability": [],
+                                "precipitation": [], "wind_speed_10m": [], "temperature_2m": []} for _ in range(10)]
+    return result
+
+
+def gfs_synoptic(observer, days=5, step_h=3):
+    """直达 GFS 的观测点等压面形势（850/925/1000hPa 温度、850hPa 风与位势高度、2m/10m 地面要素）。
+    返回与 open_meteo_synoptic 相同结构，供 _synoptic_full 做冷空气/锋面切变/槽脊/逆温检测：
+    time/cloud_cover/temperature_2m/temperature_850hPa|925hPa|1000hPa/
+    wind_speed_850hPa/wind_direction_850hPa/geopotential_height_850hPa/
+    wind_speed_10m/wind_direction_10m。
+    任一步骤失败抛异常，由上层回退 Open-Meteo（评分降级，不阻塞）。"""
+    try:
+        import cfgrib  # noqa: F401
+    except Exception:
+        raise RuntimeError("GFS 解析依赖 cfgrib 未安装，回退 Open-Meteo")
+    run = _gfs_latest_run()
+    if run is None:
+        raise RuntimeError("NOMADS 无可用 GFS 运行，回退 Open-Meteo")
+    dstr, cyc = run
+    lat, lon = float(observer["lat"]), float(observer["lon"])
+    # 观测点小包围盒（±2°），钳制到 GFS 全球边界
+    lat0, lat1 = max(-89.75, lat - 2.0), min(89.75, lat + 2.0)
+    lon0, lon1 = max(-179.75, lon - 2.0), min(179.75, lon + 2.0)
+    hours = list(range(0, days * 24 + 1, step_h))
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _download(h):
+        params = {"file": f"gfs.t{cyc:02d}z.pgrb2.0p25.f{h:03d}",
+                  "dir": f"/gfs.{dstr}/{cyc:02d}/atmos", "subregion": "",
+                  "toplat": f"{lat1:.2f}", "bottomlat": f"{lat0:.2f}",
+                  "leftlon": f"{lon0:.2f}", "rightlon": f"{lon1:.2f}",
+                  "var_TMP": "on", "var_RH": "on", "var_UGRD": "on", "var_VGRD": "on", "var_HGT": "on",
+                  "var_TCDC": "on",
+                  "lev_850_mb": "on", "lev_925_mb": "on", "lev_1000_mb": "on",
+                  "lev_2_m_above_ground": "on", "lev_10_m_above_ground": "on",
+                  "lev_entire_atmosphere": "on"}
+        return h, SESSION.get(_GFS_FILTER, params=params, timeout=40)
+
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for h, resp in ex.map(_download, hours):
+            if resp.status_code == 200 and resp.content[:6] != b"<!doct":
+                fetched[h] = resp.content
+    if not fetched:
+        raise RuntimeError("GFS 形势数据下载全部失败，回退 Open-Meteo")
+
+    def _parse(h, content):
+        tmp = f"/tmp/gfs_syn_{h}_{id(content)}.grib2"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        try:
+            dss = cfgrib.open_datasets(tmp, backend_kwargs={"errors": "ignore"})
+        except Exception:
+            try: os.remove(tmp)
+            except Exception: pass
+            return h, None
+        # 等压面场（TMP/RH/UGRD/VGRD/HGT 为 K×lat×lon 三维）与 2D 平面场分开收集
+        fields, iso = {}, {}
+        for ds in dss:
+            if "isobaricInhPa" in ds.coords:
+                pres = np.asarray(ds["isobaricInhPa"].values, dtype=float)
+                latv = ds["latitude"].values; lonv = ds["longitude"].values
+                ni, nj = len(latv), len(lonv)
+                for name in ds.data_vars:
+                    try:
+                        a = ds[name].values
+                        if a.ndim == 3 and a.shape[0] == len(pres) and a.shape[1:] == (ni, nj) and name not in iso:
+                            iso[name] = (pres, a)
+                    except Exception:
+                        continue
+            else:
+                latv = ds["latitude"].values; lonv = ds["longitude"].values
+                ni, nj = len(latv), len(lonv)
+                for name in ds.data_vars:
+                    try:
+                        a = ds[name].values
+                        if a.ndim == 2 and a.shape == (ni, nj) and name not in fields:
+                            fields[name] = a
+                    except Exception:
+                        continue
+        try: os.remove(tmp)
+        except Exception: pass
+        if not fields and not iso:
+            return h, None
+        return h, (fields, iso)
+
+    parsed = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for h, pi in ex.map(lambda hc: _parse(hc[0], hc[1]), fetched.items()):
+            parsed[h] = pi
+    parsed = {h: pi for h, pi in parsed.items() if pi is not None}
+    if not parsed:
+        raise RuntimeError("GFS 形势解析失败，回退 Open-Meteo")
+
+    # 网格尺寸：优先取等压面三维场，其次 2D 平面场（parsed 值为 (fields, iso) 元组）
+    sample_fields, sample_iso = next(iter(parsed.values()))
+    ni = nj = None
+    for name, (pres, a) in sample_iso.items():
+        ni, nj = a.shape[1], a.shape[2]; break
+    if ni is None:
+        for name, a in sample_fields.items():
+            ni, nj = a.shape; break
+    if ni is None:
+        raise RuntimeError("GFS 形势网格尺寸未知，回退 Open-Meteo")
+    dlat = dlon = 0.25
+    i = int(round((lat - lat0) / dlat)); j = int(round((lon - lon0) / dlon))
+    i = max(0, min(ni - 1, i)); j = max(0, min(nj - 1, j))
+
+    run_start = datetime(int(dstr[:4]), int(dstr[4:6]), int(dstr[6:8]), cyc, 0, tzinfo=timezone.utc)
+    out = {"time": [], "cloud_cover": [], "temperature_2m": [],
+           "temperature_850hPa": [], "temperature_925hPa": [], "temperature_1000hPa": [],
+           "wind_speed_850hPa": [], "wind_direction_850hPa": [], "geopotential_height_850hPa": [],
+           "wind_speed_10m": [], "wind_direction_10m": [], "series": "gfs"}
+    for h in sorted(parsed):
+        fields, iso = parsed[h]
+
+        def _2d(name):
+            a = fields.get(name)
+            if a is None: return None
+            try:
+                v = float(a[i, j]); return None if v != v else v
+            except Exception:
+                return None
+
+        def _iso(name, plev):
+            if name not in iso: return None
+            pres, a = iso[name]
+            kk = int(np.argmin(np.abs(pres - plev)))
+            try:
+                v = float(a[kk, i, j]); return None if v != v else v
+            except Exception:
+                return None
+
+        t2m = _2d("t2m"); u10 = _2d("u10"); v10 = _2d("v10"); tcc = _2d("tcc")
+        t850 = _iso("t", 850); t925 = _iso("t", 925); t1000 = _iso("t", 1000)
+        u850 = _iso("u", 850); v850 = _iso("v", 850); gh850 = _iso("gh", 850)
+        valid = run_start + timedelta(hours=h)
+        out["time"].append(valid.astimezone(TZ).strftime("%Y-%m-%dT%H:%M"))
+        out["cloud_cover"].append(tcc)
+        # 温度字段 GFS 为开尔文，转摄氏以匹配 Open-Meteo 单位
+        out["temperature_2m"].append(None if t2m is None else round(t2m - 273.15, 2))
+        out["temperature_850hPa"].append(None if t850 is None else round(t850 - 273.15, 2))
+        out["temperature_925hPa"].append(None if t925 is None else round(t925 - 273.15, 2))
+        out["temperature_1000hPa"].append(None if t1000 is None else round(t1000 - 273.15, 2))
+        if u850 is not None and v850 is not None:
+            out["wind_speed_850hPa"].append(round(math.hypot(u850, v850), 1))
+            out["wind_direction_850hPa"].append(round((270 - math.degrees(math.atan2(v850, u850))) % 360, 1))
+        else:
+            out["wind_speed_850hPa"].append(None); out["wind_direction_850hPa"].append(None)
+        out["geopotential_height_850hPa"].append(None if gh850 is None else round(gh850, 0))
+        if u10 is not None and v10 is not None:
+            out["wind_speed_10m"].append(round(math.hypot(u10, v10), 1))
+            out["wind_direction_10m"].append(round((270 - math.degrees(math.atan2(v10, u10))) % 360, 1))
+        else:
+            out["wind_speed_10m"].append(None); out["wind_direction_10m"].append(None)
+    # 完全无等压面数据 → 无法做完整形势检测，交给上层回退
+    if not any(x is not None for x in out["temperature_850hPa"]):
+        raise RuntimeError("GFS 等压面字段缺失，回退 Open-Meteo")
+    return out
 
 
 # ---- v2.8 天气系统因子（冷空气 / 锋面切变 / 槽脊 / 逆温层 / 温度平流） ----
@@ -2210,14 +2740,21 @@ def export_history_xlsx(observer, start_date, end_date):
     hist = build_history(observer, start_date, end_date)
     # 预报段：今天起 5 天（30 分钟缓存，通常命中）
     try:
-        meteo, _ = open_meteo_corridor(observer, MOUNTAINS, model="best_match")
+        weather_from, meteo, _ = _forecast_weather(observer, model="best_match", use_gfs=True)
         aerosol, _ = open_meteo_aerosol(observer, MOUNTAINS)
     except Exception:
-        meteo = aerosol = None
+        weather_from, meteo, aerosol = "openmeteo", None, None
     fc_daily = {}
     if meteo:
         today = datetime.now(TZ).date().isoformat()
-        syn = open_meteo_synoptic(observer, model="best_match")
+        syn = None
+        if weather_from == "gfs":
+            try:
+                syn = gfs_synoptic(observer)
+            except Exception:
+                syn = None
+        if syn is None:
+            syn = open_meteo_synoptic(observer, model="best_match")
         for m in MOUNTAINS:
             try:
                 terrain = path_terrain(observer, m, len(meteo[m["id"]]))
@@ -2629,13 +3166,64 @@ def score_hour(dt, mountain, corridor, observer, air, terrain, syn=None):
     return {"time":dt.isoformat(),"score":score,"gold":gold,"empirical":empirical,"empirical_bonus":round(empirical_bonus,1),"synoptic":syn_facts,"synoptic_bonus":round(syn_bonus,1),"fog":None if fog_level is None else {"level":fog_level,"penalty":fog_penalty},"aod":None if aod is None else round(aod,3),"pm2_5":None if air.get("pm2_5") is None else round(air["pm2_5"],1),"dust":None if air.get("dust") is None else round(air["dust"],1),"low":round(max(low),1),"mid":round(max(mid[3:]),1),"high":round(sum(high)/len(high),1),"visibility":round(min(vis[:3])/1000,1),"rh":round(max(rh[:3]),1),"sun_elev":round(elev,1),"profile":profile,"blocked":blocked,"reasons":reasons or ["云量与通透度较好"]}
 
 
+def _forecast_weather(observer, model="best_match", use_gfs=True):
+    """天气源路由：优先直达 GFS 数值预报，失败自动回退 Open-Meteo。
+    返回 (weather_from, meteo, meteo_stale)。weather_from in {"gfs","openmeteo"}。
+    只在 build_forecast（预报）与 export_history_xlsx（预报段）两个入口接入直取，
+    历史回算仍走 ERA5 再分析（无分层的连续同化，直取不适用）。"""
+    if use_gfs:
+        try:
+            meteo = gfs_corridor_weather(observer, MOUNTAINS)
+            if meteo and all(any(p.get("time") for p in meteo[m["id"]]) for m in MOUNTAINS):
+                return "gfs", meteo, False
+        except Exception:
+            pass
+    return "openmeteo", *open_meteo_corridor(observer, MOUNTAINS, model=model)
+
+
 def build_forecast(observer, model="best_match"):
     if model not in WEATHER_MODELS: model="best_match"
-    meteo, meteo_stale = open_meteo_corridor(observer, MOUNTAINS, model=model)
-    aerosol, aero_stale = open_meteo_aerosol(observer, MOUNTAINS)
-    syn = open_meteo_synoptic(observer, model=model)   # v2.8: 等压面形势（冷空气/锋面/槽脊/逆温）
     warnings=[]
-    # v2.3: 数据源限流/故障时回退到缓存，页面给出提示
+    # v3.x: 天气源优先直达 GFS 数值预报（NOMADS 0.25°），失败自动回退 Open-Meteo。
+    # 提供独立开关参数 gfs 控制（默认 on），便于故障时一键关闭。
+    use_gfs = request.args.get("gfs", "1") != "0"
+    weather_from, meteo, meteo_stale = _forecast_weather(observer, model, use_gfs)
+    # v3.x: 气溶胶 AOD 优先直达 CAMS（Copernicus ADS），失败回退 Open-Meteo 代理。
+    aero_from = "cams"
+    if request.args.get("aero", "ads") != "om" and use_gfs:
+        try:
+            cached, _ = cache_get_stale(f"cams:{observer['lat']:.3f},{observer['lon']:.3f}", 10800)
+            if cached is None:
+                cams = cams_ads_aerosol(observer, MOUNTAINS)
+                cache_put(f"cams:{observer['lat']:.3f},{observer['lon']:.3f}", cams)
+            else:
+                cams = cached
+            aerosol = cams
+            aero_stale = False
+        except Exception:
+            try:
+                aerosol, aero_stale = open_meteo_aerosol(observer, MOUNTAINS)
+            except Exception:
+                aerosol, aero_stale = {}, False
+            aero_from = "openmeteo"
+    else:
+        try:
+            aerosol, aero_stale = open_meteo_aerosol(observer, MOUNTAINS)
+        except Exception:
+            aerosol, aero_stale = {}, False
+        aero_from = "openmeteo"
+    if aero_from != "cams": warnings.append("CAMS 直连不可用，已回退气溶胶数据源")
+    # v2.8/v3.x: 等压面形势也优先直达 GFS（冷空气/锋面/槽脊/逆温），失败回退 Open-Meteo
+    syn = None
+    if weather_from == "gfs":
+        try:
+            syn = gfs_synoptic(observer)
+        except Exception:
+            syn = None
+    if syn is None:
+        syn = open_meteo_synoptic(observer, model=model)
+    # v2.3/v3.x: 数据源限流/故障时回退到缓存，页面给出提示
+    if weather_from != "gfs": warnings.append("数值直取不可用，已回退天气数据源")
     if meteo_stale: warnings.append("天气数据源繁忙，本次为缓存预报（可能滞后）")
     if aero_stale: warnings.append("气溶胶数据源繁忙，本次为缓存数据（可能滞后）")
     result=[]
@@ -2665,7 +3253,13 @@ def build_forecast(observer, model="best_match"):
             item["terrain_note"] = (f"视线被 {occ_info['distance']:.0f}km 处海拔 {occ_info['terrain']:.0f}m 的地形"
                                     f"阻挡（该处视线高度仅 {occ_info['los']:.0f}m），峰顶被山体遮挡，当前观测点看不到该峰")
         result.append(item)
-    return {"observer":observer,"mountains":result,"weather_model":{"id":model,**WEATHER_MODELS[model]},"aerosol":{"status":"ready","message":"Open-Meteo CAMS Global · AOD550/PM2.5/沙尘 · 自动缓存1小时"},"warnings":warnings,"generated":datetime.now(TZ).isoformat(),"method":"所选天气模型 + Open-Meteo AOD550 + 通道云量/湿度/能见度 + v2.0 经验知识层（前夜大雨洗尘/霾层积累/观山季/日出窗口/连续晴日） + v2.8 天气系统层（850hPa 冷空气/锋面切变/槽脊/逆温层）"}
+    return {"observer":observer,"mountains":result,"weather_model":{"id":model,**WEATHER_MODELS[model]},"weather_source":"gfs" if weather_from=="gfs" else "openmeteo",
+            "aerosol_source": aero_from,
+            "aerosol":{"status":"ready","message":"CAMS Global 直连（ADS）· AOD550 · 自动缓存3小时" if aero_from=="cams" else "Open-Meteo CAMS Global · AOD550/PM2.5/沙尘 · 自动缓存1小时"},
+            "warnings":warnings,"generated":datetime.now(TZ).isoformat(),
+            "method":("GFS 全球 0.25° 数值直取（NOMADS）" if weather_from=="gfs" else "Open-Meteo 天气源")
+                     + (" + CAMS AOD550 直连（ADS）" if aero_from=="cams" else " + Open-Meteo AOD550")
+                     + " + 通道云量/湿度/能见度 + v2.0 经验知识层（前夜大雨洗尘/霾层积累/观山季/日出窗口/连续晴日） + v2.8 天气系统层（850hPa 冷空气/锋面切变/槽脊/逆温层）"}
 
 
 @APP.get("/")
