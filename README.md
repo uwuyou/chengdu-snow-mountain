@@ -20,34 +20,32 @@ python chengdu_snow_mountain.py
 
 ## 部署
 
-### Hugging Face Spaces（免费 · 无需绑卡）
+应用入口读取 `PORT` 环境变量（`os.getenv("PORT", "5000")`），自动适配各 PaaS 平台注入的端口，无需改代码。
 
-1. 注册 [huggingface.co](https://huggingface.co)（邮箱即可，**不要求信用卡**）
-2. 右上角头像 → **New Space**，配置：
-   - Space name：`chengdu-snow-mountain`
-   - License：随意（如 MIT）
-   - **SDK 选择 Docker**（关键，不要选 Gradio/Streamlit）
-   - Hardware：CPU basic（免费 2 vCPU / 16GB）
-   - Visibility：Public
-3. 创建后按页面提示连接仓库：**git push 到该 Space**（或网页直接上传文件）
-4. 等待 2-5 分钟构建，访问 `https://你的用户名-chengdu-snow-mountain.hf.space`
+### Zeabur（推荐 · 免费免绑卡 · 中文界面）
 
-应用通过 `PORT` 环境变量自动适配 Space 的 7860 端口，无需改代码。免费额度闲置 48 小时后休眠，下次访问自动唤醒。
+1. 打开 [zeabur.com](https://zeabur.com) 注册（支持 GitHub 登录 / 手机号，**无需信用卡**）
+2. 新建项目 → **部署新服务 → GitHub** → 导入本仓库
+3. 平台自动识别 Python 并构建（或选择 Dockerfile）
+4. 部署完成后在服务设置里绑定域名，得到固定地址 `https://xxx.zeabur.app`
 
-### Render（免费额度，可能需要手机验证）
+> 免费计划支持 1 个服务 + 1 个自定义域名，适合个人长期使用；国内访问速度快。
 
-**一键部署（推荐）**：仓库根目录已提供 `render.yaml`（Render Blueprint）。
+### Koyeb（备选 · 免费免绑卡）
 
-1. 在 [render.com](https://render.com) 用 GitHub 账号登录
-2. 后台选择 **New + → Blueprint**，连接本仓库
-3. 自动读取 `render.yaml` 创建并部署 `chengdu-snow-mountain` Web 服务
-4. 部署完成后会分配固定公网地址 `https://chengdu-snow-mountain.onrender.com`
+1. 打开 [koyeb.com](https://koyeb.com) 注册（GitHub 登录，免费 Starter 计划**不需要信用卡**）
+2. Create Web Service → 连接本 GitHub 仓库
+3. 自动构建部署，得到固定地址 `https://xxx.koyeb.app`
 
-> 免费实例 15 分钟无流量会进入休眠，下次访问自动唤醒（首屏稍慢属正常）。
+> 免费实例 1 小时无流量会休眠，下次访问自动唤醒（首屏稍慢属正常）。
+
+### Render（需要绑定银行卡验证）
+
+仓库根目录已提供 `render.yaml`（Blueprint 一键部署），部署后会得到固定地址 `https://chengdu-snow-mountain.onrender.com`。**注意**：Render 新账号创建服务（含免费实例）要求先绑定银行卡做身份验证，无卡用户请改用上方 Zeabur / Koyeb。
 
 ### Railway / Fly.io / PythonAnywhere
 
-应用入口读取 `PORT` 环境变量（`os.getenv("PORT", "5000")`），适配各 PaaS 平台，按平台文档创建 Web 服务即可。
+入口适配各平台 `PORT` 环境变量，按平台文档创建 Web 服务即可；这些平台免费层多要求绑卡，请以官方最新政策为准。
 
 ## 数据源
 
