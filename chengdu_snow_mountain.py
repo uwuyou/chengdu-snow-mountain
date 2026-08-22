@@ -1102,28 +1102,66 @@ def _slider_latest_ts():
     r.raise_for_status()
     return str(r.json()["timestamps_int"][0])
 
+_slider_dl_lock = threading.Lock()
+
 def _slider_full_png(ts, z=1):
-    """下载 GK2A 全盘 band_13 瓦片拼图（P 模式，索引即 ircimss2 色标值）。缓存 10 分钟。"""
+    """下载 GK2A 全盘 band_13 瓦片拼图（P 模式，索引即 ircimss2 色标值）。缓存 10 分钟。
+    v2.10.22: 4 瓦片并行下载 + 失败降级过期缓存 + 互斥锁防并发重复下载（SLIDER 国际带宽慢，
+    单张瓦片需 10-25s，串行需 40-60s；并行最快一张图 20s 内可完成）。"""
     key = f"obs:kmaimg:{ts}"
     cached = cache_get(key, 600)
     if cached is not None: return cached
-    ymd = f"{ts[:4]}/{ts[4:6]}/{ts[6:8]}"
-    n = 2 ** z
-    from PIL import Image as _Img
-    imgs = []
-    for rr in range(n):
-        for cc in range(n):
+    stale = cache_get_stale(key, 600)
+    if not _slider_dl_lock.acquire(blocking=False):
+        # 已有线程在下载：先等 12s 拿新图；拿不到且有过期缓存则降级返回，避免等待者卡死
+        waited = 0
+        while waited < 12:
+            time.sleep(2); waited += 2
+            c = cache_get(key, 600)
+            if c is not None: return c
+        s = cache_get_stale(key, 600)
+        if s is not None and s[0] is not None: return s[0]
+        while waited < 60:
+            time.sleep(3); waited += 3
+            c = cache_get(key, 600)
+            if c is not None: return c
+        return stale[0] if (stale and stale[0] is not None) else None
+    try:
+        # 双检：等待锁期间可能已被其他线程填充
+        c = cache_get(key, 600)
+        if c is not None: return c
+        ymd = f"{ts[:4]}/{ts[4:6]}/{ts[6:8]}"
+        n = 2 ** z
+        from PIL import Image as _Img
+        import concurrent.futures as _cf
+        def _fetch(rr, cc):
             r = SESSION.get(
                 f"https://slider.cira.colostate.edu/data/imagery/{ymd}/gk2a---full_disk/band_13/{ts}/{z:02d}/{rr:03d}_{cc:03d}.png",
-                timeout=25)
+                timeout=40)
             r.raise_for_status()
-            imgs.append(_Img.open(io.BytesIO(r.content)).convert("P"))
-    W = imgs[0].width
-    full = _Img.new("P", (W*n, W*n))
-    for i, im in enumerate(imgs):
-        full.paste(im, ((i % n)*W, (i // n)*W))
-    cache_put(key, full)
-    return full
+            return _Img.open(io.BytesIO(r.content)).convert("P")
+        tiles = [None] * (n * n)
+        with _cf.ThreadPoolExecutor(max_workers=n * n) as ex:
+            futs = {ex.submit(_fetch, rr, cc): (rr, cc) for rr in range(n) for cc in range(n)}
+            for f in _cf.as_completed(futs):
+                rr, cc = futs[f]
+                tiles[rr * n + cc] = f.result()
+        if any(t is None for t in tiles):
+            raise RuntimeError("瓦片下载不完整")
+        W = tiles[0].width
+        full = _Img.new("P", (W * n, W * n))
+        for i, im in enumerate(tiles):
+            full.paste(im, ((i % n) * W, (i // n) * W))
+        cache_put(key, full)
+        return full
+    except Exception as e:
+        print(f"[slider] 下载失败 {type(e).__name__}: {e}", flush=True)
+        # 降级：返回过期缓存（最多 30 分钟），仍能出预报但标注时次滞后
+        if stale and stale[0] is not None:
+            return stale[0]
+        raise
+    finally:
+        _slider_dl_lock.release()
 
 def _fire_cloud_analyze_kma(lat, lon, elev, az):
     """GK2A 太阳扇区中高云分析（含"云底受光"几何过滤）。
@@ -2984,28 +3022,49 @@ let _fcData=null,_fcLayer=null,_fcSrc='fy4';
 function switchFireSrc(src){
   if(src===_fcSrc)return;
   _fcSrc=src;
-  const box=$('fireCloudBox');if(box)box.innerHTML='<div class="obs-load">☁ 正在切换数据源分析太阳方向中高云…</div>';
+  const box=$('fireCloudBox');if(box)box.innerHTML=src==='kma'
+    ?'<div class="obs-load">☁ 正在下载 KMA 千里眼2A 卫星图（国际带宽较慢，约需 20-40 秒），请稍候…</div>'
+    :'<div class="obs-load">☁ 正在切换数据源分析太阳方向中高云…</div>';
   loadFireCloud();
 }
 function loadFireCloud(){
   const box=$('fireCloudBox');if(!box)return;
   const lat=+$('lat').value,lon=+$('lon').value;
-  fetch('/api/fire-cloud?lat='+lat+'&lon='+lon+'&src='+_fcSrc,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  // v2.10.22: KMA 源下载慢，fetch 加 75s 超时，超时给出明确提示而非一直转圈
+  const ctl=typeof AbortController!=='undefined'?new AbortController():null;
+  const timer=ctl?setTimeout(()=>ctl.abort(),75000):null;
+  fetch('/api/fire-cloud?lat='+lat+'&lon='+lon+'&src='+_fcSrc,{cache:'no-store',signal:ctl?ctl.signal:undefined}).then(r=>r.json()).then(j=>{
     if(!j.ok||!j.data)throw Error(j.error||'暂无数据');
     _fcData=j.data;
     box.innerHTML=renderFireCloud(j.data);
     drawFireCloudMap(j.data,true);
-  }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">火烧云预报加载失败：'+e.message+'</div>'});
+  }).catch(e=>{
+    const slow=_fcSrc==='kma';
+    box.innerHTML='<div class="hist-note" style="color:var(--red)">火烧云预报加载失败：'+e.message+(slow?'。<br>KMA 卫星图下载超时（国际链路慢），可稍后重试或先用风云四号源。':'')+'</div>';
+  }).finally(()=>{if(timer)clearTimeout(timer)});
 }
 function renderFireCloud(d){
   const lv=d.level==='高'?'#e05a2b':d.level==='中'?'#c07f2a':d.level==='低'?'#8aa0b0':'#9aa8b5';
   const sun=d.sun,s=d.sector,t=new Date(d.time_bj);
   const pct=Math.max(0,Math.min(100,s.midhigh_rate));
   const litPct=Math.max(0,Math.min(100,s.lit_rate||0));
+  // v2.10.22: 醒目数据源状态条——切换后时次/数据源一目了然
+  const srcName=d.src==='kma'?'KMA 千里眼2A (GK2A)':'风云四号';
+  const srcBg=d.src==='kma'?'#eef4f8':'#eef8f1';
+  const srcFg=d.src==='kma'?'#2d6a8f':'#3e8e6e';
   let html=`<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px"><span style="font-size:11px;color:var(--muted)">数据源</span><button onclick="switchFireSrc('fy4')" style="padding:5px 10px;font-size:11.5px;${d.src==='fy4'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">风云四号</button><button onclick="switchFireSrc('kma')" style="padding:5px 10px;font-size:11.5px;${d.src==='kma'?'background:var(--accent);border-color:var(--accent);color:#fff':'background:#f4f7f9;color:#3b5163'}">KMA 千里眼2A</button></div>`;
+  html+=`<div style="display:flex;align-items:center;gap:8px;margin-top:8px;padding:7px 10px;border-radius:8px;background:${srcBg};border:1px solid ${srcFg}33"><span style="font-size:11.5px;font-weight:700;color:${srcFg}">当前数据源：${srcName}</span><span style="font-size:11px;color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次 · 扇区内中高云 ${s.midhigh_rate}%</span></div>`;
   html+='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">';
   html+=`<div style="min-width:96px;padding:12px 10px;border-radius:12px;background:linear-gradient(135deg,#fdf0e4,#f6dcc2);text-align:center"><div style="font-size:11px;color:#a06a1f">潜力评分</div><div style="font-size:26px;font-weight:800;color:${lv}">${d.score}</div><div style="font-size:11px;font-weight:700;color:${lv}">${d.level}</div></div>`;
-  html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区『云底受光』中高云占比（阳光从云边界下方穿过照亮云底才算）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${litPct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>云底受光 <b>${(s.lit_rate||0).toFixed(1)}%</b></span><span>中高云 ${s.midhigh_rate}%</span><span>总云量 ${s.cloud_rate}%</span><span style="color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</span></div></div></div>`;
+  html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区『云底受光』中高云占比（阳光从云边界下方穿过照亮云底才算）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${litPct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>云底受光 <b>${(s.lit_rate||0).toFixed(1)}%</b></span><span>中高云 ${s.midhigh_rate}%</span><span>总云量 ${s.cloud_rate}%</span></div></div></div>`;
+  // v2.10.22: 无受光云时给出物理原因（正午太阳太高/夜间太低/云太远），避免误以为功能失效
+  const litNote = (s.lit_rate||0)===0
+    ? (sun.elev>10
+        ? `当前太阳高度角 ${sun.elev}° 过高（正午），阳光无法从地平线方向射入云底下方，${srcName}扇区内虽检测到中高云（${s.midhigh_rate}%），但均处于阴影中，不会形成火烧云`
+        : sun.elev<-10
+          ? `当前太阳已低于地平线 ${-sun.elev}°，无阳光照射，不可能出现火烧云`
+          : `当前太阳高度角 ${sun.elev}°，扇区内中高云（${s.midhigh_rate}%）距离过远或云底过高，光线无法从云边界下方穿过照亮云底`)
+    : '';
   const rows=[
     ['时段','<b>'+sun.phase+'</b>（太阳方位 '+sun.az+'° · 高度角 '+sun.elev+'°）'],
     ['扇区','太阳方位 ±'+s.half_width+'° 扇形内统计'],
@@ -3014,6 +3073,7 @@ function renderFireCloud(d){
     ['黄金窗口',d.window?'<b style="color:#e05a2b">处于日出/日落 ±10° 窗口</b>':'当前不在日出/日落窗口'],
   ];
   html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
+  if(litNote)html+=`<div class="hist-note" style="margin-top:10px;color:#b07a2a">💡 ${litNote}</div>`;
   html+='<div class="obs-note" style="margin-top:10px">'+d.note+'</div>';
   html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px">定位到火烧云范围</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变=中高云分布范围</span></div>`;
   return html;
