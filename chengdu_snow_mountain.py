@@ -191,12 +191,41 @@ def cache_get_stale(key, max_age):
         return item[1], time.time() - item[0] >= max_age
 
 
-def http_get_json(url, params, timeout=30, tries=3, wait=1.0):
+# ---- Open-Meteo 限流加固（v2.10.25）----
+# 共享出口 IP 高频并发容易触发 open-meteo 的 "Too many concurrent requests"(429)：
+# 免费层限制每个 IP 同时 1 个请求、超过 5 个排队即报错。
+# 方案：1) 进程内令牌桶限频（每 0.35s 放行 1 个请求），压制瞬时并发；
+#      2) 对 open-meteo 域名的发起加全局互斥，天然串行化并发请求；
+#      3) 429/5xx 深度退避，并把异常交给调用方做"过期缓存兜底"。
+_OM_MIN_INTERVAL = 0.35          # 两次发起的最小时间间隔（进程内）
+_om_lock = threading.Lock()      # 全局串行锁（仅用于 open-meteo 域名）
+_om_last_ts = [0.0]              # 上次发起时间戳（令牌桶）
+_OM_HOSTS = ("api.open-meteo.com", "air-quality-api.open-meteo.com",
+             "archive-api.open-meteo.com", "global-marine-api.open-meteo.com")
+
+
+def _om_throttle():
+    """令牌桶：保证对 open-meteo 的每次发起间隔 >= _OM_MIN_INTERVAL。"""
+    with _om_lock:
+        now = time.time()
+        wait = _OM_MIN_INTERVAL - (now - _om_last_ts[0])
+        if wait > 0:
+            time.sleep(wait)
+        _om_last_ts[0] = time.time()
+
+
+def http_get_json(url, params, timeout=30, tries=3, wait=1.0, throttle=True):
     """带指数退避的 GET：429/5xx/网络错误自动重试，全部失败后抛出最后一次异常。
-    v2.4: 退避缩短（1s、2s）——快速失败优先，避免单请求拖太久触发网关超时。"""
+    v2.4: 退避缩短（快速失败优先，避免单请求拖太久触发网关超时）。
+    v2.10.25: 对 open-meteo 域名自动开启进程内限频（令牌桶），串行压制并发，
+    规避共享 IP 的 "Too many concurrent requests"; 429 退避延长以等配额恢复。
+    返回 r.json()；调用失败抛最后一次异常，供上层回退过期缓存。"""
+    is_om = throttle and url.startswith("https://") and any(h in url for h in _OM_HOSTS)
     last = None
     for attempt in range(tries):
         try:
+            if is_om:
+                _om_throttle()
             r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 429 or r.status_code >= 500:
                 raise requests.HTTPError(f"{r.status_code} {r.reason}", response=r)
@@ -205,7 +234,11 @@ def http_get_json(url, params, timeout=30, tries=3, wait=1.0):
         except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as e:
             last = e
             if attempt < tries - 1:
-                time.sleep(wait * (attempt + 1))
+                # 429 限流等待更久（配额恢复），5xx/网络错误用较短退避
+                is429 = isinstance(last, requests.HTTPError) and getattr(last, "response", None) is not None \
+                        and last.response.status_code == 429
+                d = (wait * 3 + 2.0) if is429 else wait * (attempt + 1)
+                time.sleep(d)
     raise last
 
 
@@ -1714,8 +1747,8 @@ def cloud_trend(lat, lon):
     采样点：观测点 + 沿西岭方向走廊中段/远端（Open-Meteo forecast 单次多站请求）。
     返回 4 小时（当前+3）的分层云量序列与趋势/判断文案。缓存 10 分钟。"""
     key = f"obs:ct:{lat:.2f},{lon:.2f}"
-    cached = cache_get(key, 600)
-    if cached is not None: return cached
+    cached, cached_stale = cache_get_stale(key, 600)
+    if cached is not None and not cached_stale: return cached
     try:
         seg = interpolate_great_circle(lat, lon, MOUNTAINS[0]["lat"], MOUNTAINS[0]["lon"], 10)
         pts = [(lat, lon), seg[2], seg[4]]  # 观测点 / 走廊中段 / 远端
@@ -1814,7 +1847,30 @@ def cloud_trend(lat, lon):
         cache_put(key, out)
         return out
     except Exception:
-        return None
+        # v2.10.25: Open-Meteo 挂了时回退过期缓存；无缓存则用卫星云况近似
+        if cached is not None:
+            return cached
+        try:
+            sim = fy4_cloud_analysis(lat, lon) or {}
+            st = sim.get("stats") or {}
+            cloud = st.get("cloud_ratio") or st.get("cloudy_rate") or 0.0
+            now0 = datetime.now(TZ).replace(minute=0, second=0, microsecond=0)
+            hours, n = [], 4
+            for h in range(n):
+                hours.append({"time": (now0 + timedelta(hours=h)).isoformat(),
+                              "cloud": cloud, "low": 0, "mid": 0, "high": 0,
+                              "pop": 0, "rh": 0, "genus": None, "genus_zh": ""})
+            cur = hours[0]
+            layer = "晴空" if cloud < 20 else ("疏云" if cloud < 45 else "多云")
+            trend_text = f"未来 3 小时云量趋势暂缺（数据源受限），当前卫星观测云量约 {cloud:.0f}%。"
+            out = {"points": ["观测点", "走廊中段", "走廊远端"], "hours": hours,
+                   "trend": {"delta": 0, "dir": "stable", "arrow": "→", "text": trend_text},
+                   "judge": {"layer": layer, "text": f"Open-Meteo 数据源受限，已用卫星云况近似：当前云量约 {cloud:.0f}%。", "genus": None},
+                   "degraded": True, "generated": datetime.now(TZ).isoformat()}
+            cache_put(key, out)
+            return out
+        except Exception:
+            return None
 
 
 # ---- v2.9.7: 云图影响范围标注（观测点+雪山+视线走廊+走廊云量） ----
@@ -1827,8 +1883,8 @@ def cloud_map_data(lat, lon, model="best_match"):
     """为云图叠加标注提供数据：观测点、四座雪山、每条视线走廊的采样点与当前分层云量。
     复用 Open-Meteo 走廊预报（缓存），取当前时次；失败则返回无云量的走廊点。缓存 10 分钟。"""
     key = f"obs:cm:{lat:.2f},{lon:.2f}"
-    cached = cache_get(key, 600)
-    if cached is not None: return cached
+    cached, cached_stale = cache_get_stale(key, 600)
+    if cached is not None and not cached_stale: return cached
     try:
         pts, owners = [], []
         corridors = []
@@ -1887,7 +1943,38 @@ def cloud_map_data(lat, lon, model="best_match"):
         cache_put(key, out)
         return out
     except Exception:
-        return None
+        # v2.10.25: 多级降级——① 过期缓存优先 ② 卫星云况近似 ③ 纯几何骨架(仍有雪山/观测点/走廊线)
+        if cached is not None:
+            return cached
+        try:
+            sim = fy4_cloud_analysis(lat, lon) or {}
+            st = sim.get("stats") or {}
+            cloudy_rate = st.get("cloudy_rate") or 0.0
+            cloud = st.get("cloud_ratio") or cloudy_rate
+            gen = "st" if cloud > 60 else ("sc" if cloud > 30 else "ci")
+            cur_time = (sim.get("time_bj") or "")[:16].replace("T", " ")
+            geo = cloud >= 0  # 卫星数据可用
+        except Exception:
+            st, cloud, gen, cur_time, geo = {}, 0.0, "ci", "", False
+        corridors_out = []
+        for m in MOUNTAINS:
+            seg = interpolate_great_circle(lat, lon, m["lat"], m["lon"], 10)
+            points = []
+            for p in seg:
+                points.append({"lat": round(p[0], 4), "lon": round(p[1], 4),
+                               "cloud": (None if not geo else round(cloud)),
+                               "low": None, "mid": None, "high": None,
+                               "rh": None, "pop": None, "genus": gen,
+                               "genus_zh": GN_ZH_PY.get(gen, "")})
+            corridors_out.append({"id": m["id"], "name": m["name"], "elev": m["elev"],
+                                  "lat": m["lat"], "lon": m["lon"], "points": points})
+        out = {"observer": {"lat": lat, "lon": lon},
+               "src_bbox": SAT_SRC_BBOX, "bbox": SAT_VIEW_BBOX,
+               "hour": cur_time, "corridors": corridors_out,
+               "degraded": ("satellite" if geo else "geometry"),
+               "generated": datetime.now(TZ).isoformat()}
+        cache_put(key, out)
+        return out
 
 
 def _num(v):
