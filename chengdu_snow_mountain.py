@@ -690,6 +690,17 @@ FY4_WMS_W, FY4_WMS_H = 700, 700
 # 裁剪出的川西走廊范围（含成都平原 + 川西雪山带）
 FY4_CROP = {"lon0": 96.5, "lon1": 112.0, "lat0": 24.0, "lat1": 36.5}
 FY4_OUT_W = 900                         # 输出图宽度（放大后）
+# v2.10.17: GEOS_IRX 二值图为「白=云、透明=晴空」，透明区叠到浅色底图上无法分辨。
+# 将透明(晴空)填充为深蓝夜空色，形成「深底+白云」强对比，云况一目了然。
+FY4_CLEAR_RGB = (18, 26, 46)           # 晴空底色（深蓝黑）
+
+def _fy4_fill_clear(img):
+    """把 RGBA 图中透明像素替换为晴空深色底，返回不透明 RGBA 图。"""
+    from PIL import Image as _Img
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    bg = _Img.new("RGBA", img.size, FY4_CLEAR_RGB + (255,))
+    return _Img.alpha_composite(bg, img)
 
 def fy4_irx_png(now=None):
     """拉取最新风云四号红外云图并裁剪川西区域，返回 (PNG字节, 时次dict) 或 None。
@@ -718,6 +729,8 @@ def fy4_irx_png(now=None):
         from PIL import Image
         import io as _io
         img = Image.open(_io.BytesIO(r2.content)).convert("RGBA")
+        # v2.10.17: 透明(晴空)填充深色底，避免叠浅色底图时"一片白"分不清云
+        img = _fy4_fill_clear(img)
         # 3) 裁剪川西范围（等距投影：x 与经度线性、y 与纬度线性）
         lon0, lon1 = float(FY4_WMS_BBOX.split(",")[0]), float(FY4_WMS_BBOX.split(",")[2])
         lat1, lat0 = float(FY4_WMS_BBOX.split(",")[3]), float(FY4_WMS_BBOX.split(",")[1])
@@ -805,6 +818,8 @@ def _fy4_irx_anim_impl(now):
             if not r2.content or len(r2.content) < 2000:
                 continue  # 该时次空白，跳过
             img = Image.open(_io.BytesIO(r2.content)).convert("RGBA")
+            # v2.10.17: 透明(晴空)填充深色底，避免动画帧叠浅色底图时一片白
+            img = _fy4_fill_clear(img)
             crop = img.crop((px0, py0, px1, py1))
             frames.append(crop.resize((FY4_ANIM_OUT_W, oh), Image.LANCZOS))
             ok_times.append(dt)
