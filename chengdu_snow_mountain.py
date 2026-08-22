@@ -3456,6 +3456,8 @@ function renderFireCloud(d){
   if(litNote)html+=`<div class="hist-note" style="margin-top:10px;color:#b07a2a">💡 ${litNote}。<br>点击下方「定位到火烧云范围」将跳转到太阳方向扇区查看（黄色楔形范围）。</div>`;
   html+='<div class="obs-note" style="margin-top:10px">'+d.note+'</div>';
   html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px;font-weight:600">定位到火烧云范围（查看实况详解）</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变+亮橙圆点=云底受光中高云位置</span></div>`;
+  // v2.10.26: 若已点击「定位」则随每次渲染自动附带详解面板，避免被后续重渲染冲掉
+  if(window._fcExplainOpen===true) html+=fireCloudExplain(d);
   return html;
 }
 function fireCloudExplain(d){
@@ -3561,8 +3563,10 @@ function drawFireCloudMap(d,fast){
 function fitFireCloud(){
   // v2.10.23: 修复"点击没反应"——无受光云(cells为空)时不再静默return，
   // 改为定位到太阳扇区并给出提示；单点云区时用扇区端点兜底防 fitBounds 退化。
-  // v2.10.26: 定位后插入「详细实况解释面板」fireCloudExplain。
+  // v2.10.26: 用标志位 _fcExplainOpen 触发详解面板，随 renderFireCloud 每次渲染自动附带，
+  // 规避"弹窗一闪而过"(switchTab('live') 链再调 loadFireCloud 会整体重写 fireCloudBox)。
   if(!_fcData)return;
+  window._fcExplainOpen=true;
   const lat=+$('lat').value,lon=+$('lon').value;
   const az=_fcData.sun.az,hw=_fcData.sector.half_width;
   const cells=_fcData.cells||[];
@@ -3575,19 +3579,11 @@ function fitFireCloud(){
   if(cells.length){cells.forEach(c=>acc([c.lat,c.lon]))}
   const b=[[maxLat,minLon],[minLat,maxLon]].map(ll=>wgsToGcj(ll[0],ll[1]));
   switchTab('live');
+  // 立即在当前已渲染的 DOM 里插入详解(若 fireCloudBox 已渲染);后续重渲染也会保留
+  const boxEl=$('fireCloudBox');
+  if(boxEl&&_fcData){let ex=boxEl.querySelector('.fc-fit-tip');if(ex)ex.remove();const n=document.createElement('div');n.className='fc-fit-tip';n.style.marginTop='8px';n.innerHTML=fireCloudExplain(_fcData);const on=boxEl.querySelector('.obs-note');if(on)boxEl.insertBefore(n,on);else boxEl.appendChild(n);}
   setTimeout(()=>{
     liveMap.fitBounds(b,{padding:[24,24],maxZoom:7});
-    // 插入详细实况解释面板（始终显示）——放在地图容器的火烧云信息区上方
-    const boxEl=$('fireCloudBox');if(!boxEl)return;
-    let explain=boxEl.querySelector('.fc-fit-tip');
-    if(explain)explain.remove();                 // 移除旧的，避免堆积
-    const ex=document.createElement('div');
-    ex.className='fc-fit-tip';
-    ex.style.marginTop='8px';
-    ex.innerHTML=fireCloudExplain(_fcData);
-    // 插入到算法说明 obs-note 之前
-    const obsNote=boxEl.querySelector('.obs-note');
-    if(obsNote)boxEl.insertBefore(ex,obsNote); else boxEl.appendChild(ex);
   },120);
 }
 // v2.9.8: 西南区域裁剪放大（CSS 定位+缩放，避免跨域图片污染 canvas）
