@@ -1209,6 +1209,241 @@ def _fire_cloud_analyze_kma(lat, lon, elev, az):
         avg_g = 0
     return (n_cld/n_tot*100, n_mh/n_tot*100, n_lit/n_tot*100, avg_g, mid_high, ts)
 
+def _slider_geo_to_pixel(lon, lat, z=1):
+    """GK2A GEOS 投影：经纬度 → 全盘拼图（z 缩放）中像素坐标 (xx, yy)。
+    球面几何正解：从地心坐标直接推东向/北向扫描角，精度约 0.01°（< 1 像素）。"""
+    cfg = SLIDER_CFG
+    scale = 2 ** (cfg["z_max"] - z)
+    cx = (cfg["tile_size"] / 2) * 2 ** cfg["z_max"] / scale
+    sx_r = cfg["disk_radius_x_z0"] * 2 ** cfg["z_max"] / scale
+    sy_r = cfg["disk_radius_y_z0"] * 2 ** cfg["z_max"] / scale
+    mx, my = cfg["max_rad_x"], cfg["max_rad_y"]
+    # GEOS 投影正解（球面近似，与 _slider_inv_latlon 自洽）
+    # 卫星位于赤道上空 128°E，高度 H，地球半径 R
+    H = SLIDER_H_ALT
+    R = SLIDER_R
+    phi = math.radians(lat)
+    lam = math.radians(lon - 128.0)
+    # 地表点地心坐标（卫星在 x 轴正方向 H 处）
+    x = R * math.cos(phi) * math.cos(lam)
+    y = R * math.cos(phi) * math.sin(lam)
+    z = R * math.sin(phi)
+    # 沿视线方向的距离分量（卫星到地心方向）
+    along = H - x
+    # 扫描角：东向 e，北向 s
+    e = math.atan2(y, along)
+    s = math.atan2(z, along)
+    # 圆盘外限幅（保守处理）
+    if abs(e) > mx:
+        e = max(-mx, min(mx, e))
+    if abs(s) > my:
+        s = max(-my, min(my, s))
+    xx = cx + (e / mx) * sx_r
+    yy = cx - (s / my) * sy_r
+    return xx, yy
+
+
+def kma_cloud_analysis(lat, lon):
+    """基于 GK2A band_13（ircimss2 增强红外）的观测点云况分析：中心像元 + 周围 81 像元 + 云顶高度分层。
+    返回与 fy4_cloud_analysis 一致的结构 {time_utc,time_bj,center,stats,top,note} 或 None。缓存 10 分钟。"""
+    key = f"obs:kmaactl:{float(lat):.2f},{float(lon):.2f}"
+    cached = cache_get(key, 600)
+    if cached is not None:
+        return cached
+    try:
+        ts = _slider_latest_ts()
+        full = _slider_full_png(ts)
+        arr = np.array(full)
+        Hh, Ww = arr.shape
+        z = 1
+        cfg = SLIDER_CFG
+        scale = 2 ** (cfg["z_max"] - z)
+        cx0 = (cfg["tile_size"] / 2) * 2 ** cfg["z_max"] / scale
+        sx_r = cfg["disk_radius_x_z0"] * 2 ** cfg["z_max"] / scale
+        sy_r = cfg["disk_radius_y_z0"] * 2 ** cfg["z_max"] / scale
+        mx, my = cfg["max_rad_x"], cfg["max_rad_y"]
+        # 定位观测点像元
+        cx0 = max(0, min(Ww - 1, cx0)); cy0 = max(0, min(Hh - 1, cx0))
+        px = cx0; py = cy0
+        try:
+            px, py = _slider_geo_to_pixel(lon, lat, z)
+            px = max(0, min(Ww - 1, round(px))); py = max(0, min(Hh - 1, round(py)))
+        except Exception:
+            pass
+        center_cloud = bool(int(arr[py, px]) >= 128)
+        # 周围 9×9 像元（约 80km 范围，yr kN 逐像元扫描）
+        rr = 4
+        n_cld = n_clr = 0
+        for yy in range(max(0, py - rr), min(Hh, py + rr + 1)):
+            for xx in range(max(0, px - rr), min(Ww, px + rr + 1)):
+                if int(arr[yy, xx]) >= 128:
+                    n_cld += 1
+                else:
+                    n_clr += 1
+        total = n_cld + n_clr
+        stats = {
+            "total": total, "valid": total,
+            "valid_rate": round(total / total * 100, 1) if total else 0.0,
+            "cloudy": n_cld, "cloudy_rate": round(n_cld / total * 100, 1) if total else 0.0,
+            "clear": n_clr, "clear_rate": round(n_clr / total * 100, 1) if total else 0.0,
+            "cloud_ratio": round(n_cld / total * 100, 1) if total else 0.0,
+            "clear_ratio": round(n_clr / total * 100, 1) if total else 0.0,
+        }
+        t_utc = datetime.strptime(ts[:12], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        t_bj = t_utc.astimezone(TZ)
+        top = None
+        try:
+            om = SESSION.get("https://api.open-meteo.com/v1/forecast", params={
+                "latitude": lat, "longitude": lon,
+                "current": "cloud_cover_low,cloud_cover_mid,cloud_cover_high",
+            }, timeout=20)
+            om.raise_for_status()
+            c = om.json().get("current") or {}
+            top = {"low": c.get("cloud_cover_low"), "mid": c.get("cloud_cover_mid"),
+                   "high": c.get("cloud_cover_high")}
+        except Exception as e:
+            print(f"[kma_cloud top] {type(e).__name__}: {e}", flush=True)
+        out = {
+            "time_utc": ts[:12], "time_bj": t_bj.isoformat(),
+            "center": {"lat": round(lat, 4), "lon": round(lon, 4), "row": py, "col": px,
+                       "cloud": center_cloud, "text": "有云" if center_cloud else "晴空"},
+            "stats": stats, "top": top,
+            "note": "云况基于 KMA 千里眼2A（GK2A）CIRA SLIDER band_13 增强红外云检测；"
+                    "云顶分层基于 Open-Meteo 数值模式（低/中/高云量）近似",
+        }
+        cache_put(key, out)
+        return out
+    except Exception as e:
+        print(f"[kma_cloud] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def kma_gibs_like(lat, lon):
+    """基于 GK2A band13 云顶高度（ircimss2 指数 → _cloud_top_km_kma），产出与 gibs_cloud_analysis 的 cth 同构结果。
+    返回 {ir13,cth} 或 None，供前端按源切换『卫星云顶高度』板块。缓存 10 分钟。"""
+    key = f"obs:kmath:{float(lat):.2f},{float(lon):.2f}"
+    cached = cache_get(key, 600)
+    if cached is not None:
+        return cached
+    try:
+        ts = _slider_latest_ts()
+        full = _slider_full_png(ts)
+        arr = np.array(full)
+        Hh, Ww = arr.shape
+        px, py = _slider_geo_to_pixel(lon, lat, 1)
+        px = max(0, min(Ww - 1, round(px))); py = max(0, min(Hh - 1, round(py)))
+        rr = 4
+        hts = []
+        n_high = n_mid = n_low = 0
+        for yy in range(max(0, py - rr), min(Hh, py + rr + 1)):
+            for xx in range(max(0, px - rr), min(Ww, px + rr + 1)):
+                iv = int(arr[yy, xx])
+                if iv < 128:      # 晴空/无云
+                    continue
+                h = _cloud_top_km_kma(iv)
+                hts.append(h)
+                if h >= 7: n_high += 1
+                elif h >= 3: n_mid += 1
+                else: n_low += 1
+        if len(hts) < 5:
+            out = {"ir13": None, "cth": None, "note": "观测点周边 GK2A 红外云量不足（晴空），暂无法给出云顶高度。", "src": "kma"}
+            cache_put(key, out)
+            return out
+        hts.sort()
+        n = len(hts)
+        t_utc = datetime.strptime(ts[:12], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        out = {
+            "ir13": None,
+            "cth": {
+                "source": "GK2A",
+                "time": t_utc.astimezone(TZ).isoformat(),
+                "total": n, "max": round(hts[-1], 1), "min": round(hts[0], 1),
+                "mean": round(sum(hts) / n, 1), "median": round(hts[n // 2], 1),
+                "low": n_low, "low_rate": round(n_low / n * 100, 1),
+                "mid": n_mid, "mid_rate": round(n_mid / n * 100, 1),
+                "high": n_high, "high_rate": round(n_high / n * 100, 1),
+                "note": "KMA 千里眼2A（GK2A）band_13 增强红外云顶高度（ircimss2 色标推算）",
+            },
+            "src": "kma",
+        }
+        cache_put(key, out)
+        return out
+    except Exception as e:
+        print(f"[kma_gibs] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+KMA_CROP = {"lon0": 96.5, "lon1": 112.0, "lat0": 24.0, "lat1": 36.5}
+KMA_OUT_W = 900
+KMA_CLEAR_RGB = (18, 26, 46)
+
+def _kma_pal_to_rgba(full_p):
+    """把 GK2A band13 P 模式图（ircimss2 色标）转成 RGBA，并把晴空（索引<128）填成深色底。"""
+    from PIL import Image as _Img
+    # ircimss2 近似色标：低索引=暖/晴(深/黑)，高索引=冷/云(白)。这里直接按 P→RGB 映射，
+    # 再把晴空区填成 KMA_CLEAR_RGB 深色底，使云区更醒目。
+    rgb = full_p.convert("RGBA")
+    arr = np.array(full_p)
+    mask = arr < 128  # 晴空/地面
+    rarr = np.array(rgb)
+    rarr[mask, 0] = KMA_CLEAR_RGB[0]
+    rarr[mask, 1] = KMA_CLEAR_RGB[1]
+    rarr[mask, 2] = KMA_CLEAR_RGB[2]
+    rarr[mask, 3] = 255
+    return _Img.fromarray(rarr, "RGBA")
+
+
+def kma_irx_png():
+    """GK2A band_13 红外云图裁剪川西区域，返回 {"png": bytes, "info": {time_bj, bbox, width, height}} 或 None。
+    缓存 10 分钟。"""
+    cached = cache_get("obs:kma-irx", 600)
+    if cached is not None:
+        return cached
+    try:
+        ts = _slider_latest_ts()
+        full = _slider_full_png(ts)
+        if full is None:
+            return None
+        arr = np.array(full)
+        Hh, Ww = arr.shape
+        from PIL import Image
+        # 计算裁剪区域四角像素坐标
+        c = KMA_CROP
+        corners = [(c["lon0"], c["lat1"]), (c["lon1"], c["lat1"]),
+                   (c["lon0"], c["lat0"]), (c["lon1"], c["lat0"])]
+        xs, ys = [], []
+        for lon, lat in corners:
+            try:
+                px, py = _slider_geo_to_pixel(lon, lat, 1)
+                xs.append(px); ys.append(py)
+            except Exception:
+                pass
+        if len(xs) < 2:
+            return None
+        px0, px1 = max(0, int(min(xs))), min(Ww - 1, int(max(xs)))
+        py0, py1 = max(0, int(min(ys))), min(Hh - 1, int(max(ys)))
+        if px1 - px0 < 50 or py1 - py0 < 50:
+            return None
+        rgba = _kma_pal_to_rgba(full)
+        crop = rgba.crop((px0, py0, px1, py1))
+        oh = int(KMA_OUT_W * crop.height / crop.width)
+        out = crop.resize((KMA_OUT_W, oh), Image.LANCZOS)
+        import io as _io
+        buf = _io.BytesIO()
+        out.save(buf, format="PNG")
+        t_utc = datetime.strptime(ts[:12], "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        t_bj = t_utc.astimezone(TZ)
+        info = {"time_utc": ts[:12], "time_bj": t_bj.isoformat(),
+                "bbox": [c["lat0"], c["lon0"], c["lat1"], c["lon1"]],
+                "width": KMA_OUT_W, "height": oh}
+        out_data = {"png": buf.getvalue(), "info": info}
+        cache_put("obs:kma-irx", out_data)
+        return out_data
+    except Exception as e:
+        print(f"[kma_irx] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
 def _fire_cloud_analyze_fy4(lat, lon, elev, az):
     """风云四号太阳扇区中高云分析（含"云底受光"几何过滤）。
     返回 (cloud_rate, mh_rate, lit_rate, avg_g, cells, dt) 或 None。"""
@@ -2473,15 +2708,47 @@ def api_fy4_irx_anim():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
 
 
+@APP.get("/api/kma-irx")
+def api_kma_irx():
+    """v2.10.24 KMA 千里眼2A（GK2A）band_13 红外云图 PNG（裁剪川西区域，深色晴空底）。"""
+    try:
+        data = kma_irx_png()
+        if not data:
+            return jsonify({"ok": False, "error": "KMA 红外云图暂不可用（数据源无响应或暂无最新时次）"}), 502
+        return send_file(io.BytesIO(data["png"]), mimetype="image/png",
+                         download_name="kma_irx.png", max_age=0)
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
+@APP.get("/api/kma-irx/info")
+def api_kma_irx_info():
+    """v2.10.24 KMA 红外云图元信息（时次/边界/尺寸）。"""
+    try:
+        data = kma_irx_png()
+        if not data:
+            return jsonify({"ok": False, "error": "KMA 红外云图暂不可用"}), 502
+        resp = jsonify({"ok": True, "data": data["info"]})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
 @APP.get("/api/fy4-cloud")
 def api_fy4_cloud():
-    """v2.10.13 风云四号实况云况分析：中心像元 + 周围 81 像元云掩膜统计 + 云顶高度分层。"""
+    """v2.10.13 实况云况分析：中心像元 + 周围 81 像元云掩膜统计 + 云顶高度分层。
+    src: fy4(风云四号) / kma(千里眼2A)。"""
     try:
         lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
         lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
-        data = fy4_cloud_analysis(lat, lon)
+        src = request.args.get("src", "fy4")
+        if src == "kma":
+            data = kma_cloud_analysis(lat, lon)
+        else:
+            data = fy4_cloud_analysis(lat, lon)
         if not data:
-            return jsonify({"ok": False, "error": "风云四号云况分析暂不可用（数据源无响应或暂无最新时次）"}), 502
+            return jsonify({"ok": False, "error": "云况分析暂不可用（数据源无响应或暂无最新时次）"}), 502
         resp = jsonify({"ok": True, "data": data})
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -2509,13 +2776,18 @@ def api_fire_cloud():
 
 @APP.get("/api/fy4-cloud/gibs")
 def api_fy4_cloud_gibs():
-    """v2.10.14 NASA GIBS 卫星云顶高度：Himawari 红外分级 + MODIS CTH 定量统计。"""
+    """v2.10.14 卫星云顶高度：Himawari 红外分级 + MODIS CTH 定量统计。
+    src: fy4(Himawari/MODIS GIBS) / kma(GK2A band_13 红外推算)。"""
     try:
         lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
         lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
-        data = gibs_cloud_analysis(lat, lon)
+        src = request.args.get("src", "fy4")
+        if src == "kma":
+            data = kma_gibs_like(lat, lon)
+        else:
+            data = gibs_cloud_analysis(lat, lon)
         if not data:
-            return jsonify({"ok": False, "error": "卫星云顶高度暂不可用（NASA GIBS 数据源无响应）"}), 502
+            return jsonify({"ok": False, "error": "卫星云顶高度暂不可用（数据源无响应）"}), 502
         resp = jsonify({"ok": True, "data": data})
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -2661,7 +2933,7 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 <div id="pane-kb" class="tab-pane"><div class="rules">{% for t,c,s in rules %}<div class="rule"><b>{{ t }}</b>{{ c }}<small>来源：{{ s }}</small></div>{% endfor %}</div>
 <details class="evidence"><summary>历史成功案例库（{{ success_cases|length }} 例 · 均来自公开报道，可对照学习经验规律）</summary><div class="sample-list">{% for c in success_cases %}<div class="sample"><b>{{ c.date }}</b><div>{{ c.cond }} → {{ c.sight }}</div><span class="tag">{{ c.src }}</span></div>{% endfor %}</div></details></div></div>
 <div id="pane-windy" class="tab-pane"><div class="windy-panel"><div class="panel"><div class="obs-title">Windy 实况地图 <span class="tag2">嵌入式实时气象图层 · 自动跟随当前观测点</span></div><div class="windy-ctl"><button data-windylayer="wind" class="on" onclick="setWindyLayer('wind',this)">风场</button><button data-windylayer="satellite" onclick="setWindyLayer('satellite',this)">卫星云图</button><button data-windylayer="clouds" onclick="setWindyLayer('clouds',this)">云量</button><button data-windylayer="temp" onclick="setWindyLayer('temp',this)">温度</button><button data-windylayer="rain" onclick="setWindyLayer('rain',this)">降水</button><button data-windylayer="rh" onclick="setWindyLayer('rh',this)">湿度</button><button data-windylayer="pressure" onclick="setWindyLayer('pressure',this)">气压</button></div><div id="windyBox" class="windy-box loading"><div class="windy-load">正在加载 Windy 实时地图…</div></div><div class="windy-note">数据由 <b>Windy.com</b> 通过嵌入式 iframe 提供（ECMWF/GFS/ICON 模型叠加实时观测与卫星云图），随你的观测点与所选图层实时更新。卫星云图可直观观察西部雪山区域云况。</div></div></div></div>
-<div id="pane-wm" class="tab-pane"><div class="panel"><div class="obs-title">风云四号卫星云图 <span class="tag2">红外动画（多时次）· 真彩色叠加 · 跟随当前观测点</span></div><div class="wm-ctl"><span class="grp"><b>实况</b><button data-wm-sat="fy4" onclick="toggleFy4Sat(this)">风云四号红外</button><button data-wm-sat="wxbl" onclick="toggleFy4Sat(this)">真彩色云图</button></span></div><div id="wmStatus" class="wm-status">正在初始化…</div><div id="wmMap" class="wm-map"></div><div class="wm-note">「<b>风云四号红外</b>」叠加国家卫星气象中心 WMS 红外云图（24 小时可用，白色为云，近 2 小时多时次动画循环），「<b>真彩色云图</b>」叠加中央气象台风云四号 B 星真彩色（仅白天）。点击左上角图层按钮可切换高德底图（标准/卫星）。</div></div></div>
+<div id="pane-wm" class="tab-pane"><div class="panel"><div class="obs-title">卫星云图 <span class="tag2">风云四号 / KMA 千里眼2A · 红外动画（多时次）· 真彩色叠加 · 跟随当前观测点</span></div><div class="wm-ctl"><span class="grp"><b>实况</b><button data-wm-sat="fy4" onclick="toggleFy4Sat(this)">风云四号红外</button><button data-wm-sat="kma" onclick="toggleFy4Sat(this)">KMA 红外</button><button data-wm-sat="wxbl" onclick="toggleFy4Sat(this)">真彩色云图</button></span></div><div id="wmStatus" class="wm-status">正在初始化…</div><div id="wmMap" class="wm-map"></div><div class="wm-note">「<b>风云四号红外</b>」叠加国家卫星气象中心 WMS 红外云图（24 小时可用，白色为云，近 2 小时多时次动画循环）；「<b>KMA 红外</b>」叠加韩国气象厅千里眼2A band_13 增强红外（ircimss2 色标，深色底=晴空）；「<b>真彩色云图</b>」叠加中央气象台风云四号 B 星真彩色（仅白天）。点击左上角图层按钮可切换高德底图（标准/卫星）。</div></div></div>
 <div id="simModal" class="modal" onclick="if(event.target===this)closeSimulation()"><div class="sim-box"><div class="sim-head"><div><h3 id="simTitle">天空形态模拟</h3><div id="simSub" class="meta"></div></div><button class="sim-close" onclick="closeSimulation()">关闭</button></div><canvas id="simCanvas" class="sim-canvas"></canvas><div id="simMetrics" class="sim-metrics"></div><div id="simNote" class="sim-note"></div></div></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
 const gaodeOpt={subdomains:'1234',maxZoom:18,attribution:'地图 © 高德'};
@@ -2798,7 +3070,7 @@ function setWmStatus(extra){
 }
 // v2.10.10: 标签页切换时若卫星云图已初始化过则保持状态
 function wmRefresh(){if(_wmMap)_wmMap.invalidateSize()}
-// v2.10.12: 风云四号实况云图叠加（红外 WMS 裁剪图 / 真彩色云图）
+// v2.10.24: 卫星云图叠加（风云四号红外 / KMA 红外 / 真彩色云图）
 let _wmSat=null,_wmSatLayer=null,_wmAnimUrl=null;
 function toggleFy4Sat(btn){
   if(!_wmMap){wmInit()}
@@ -2806,7 +3078,19 @@ function toggleFy4Sat(btn){
   document.querySelectorAll('.wm-ctl [data-wm-sat]').forEach(b=>b.classList.toggle('on',b===btn&&_wmSat!==mode||(b===btn&&_wmSat===null)));
   if(_wmSat===mode){_wmSat=null;if(_wmSatLayer){_wmMap.removeLayer(_wmSatLayer);_wmSatLayer=null}if(_wmAnimUrl){URL.revokeObjectURL(_wmAnimUrl);_wmAnimUrl=null}setWmStatus('已取消实况叠加');return}
   _wmSat=mode;
-  if(mode==='fy4'){loadFy4Irx(btn)}else{loadWxblSat(btn)}
+  if(mode==='fy4'){loadFy4Irx(btn)}else if(mode==='kma'){loadKmaIrx(btn)}else{loadWxblSat(btn)}
+}
+function loadKmaIrx(btn){
+  setWmStatus('正在加载 KMA 千里眼2A 红外云图（国际带宽较慢，约需 20-40 秒）…');
+  fetch('/api/kma-irx/info',{cache:'no-store'}).then(r=>r.json()).then(j=>{
+    if(!j.ok)throw Error(j.error||'加载失败');
+    const d=j.data,b=d.bbox;
+    const bounds=[[b[0],b[1]],[b[2],b[3]]];
+    if(_wmSatLayer)_wmMap.removeLayer(_wmSatLayer);
+    _wmSatLayer=L.imageOverlay('/api/kma-irx',bounds,{opacity:.85,pane:'wmPane',interactive:false}).addTo(_wmMap);
+    setWmStatus('KMA 千里眼2A 红外云图 · 时次 '+(new Date(d.time_bj).toLocaleString('zh-CN',{hour12:false}))+' · ircimss2 增强色标（深色底=晴空）');
+    if(_wmMap.getZoom()<6)_wmMap.setZoom(6,{animate:true});
+  }).catch(err=>{setWmStatus('KMA 红外加载失败: '+err.message);_wmSat=null;if(btn)btn.classList.remove('on')});
 }
 function loadFy4Irx(btn){
   setWmStatus('正在加载风云四号红外云图…');
@@ -2952,28 +3236,30 @@ function loadObs(){
     loadFy4Cloud();
   }).catch(()=>{box.style.display='none'});
 }
-// v2.10.13: 风云四号实况云况分析（红外云检测统计 + 云顶高度分层）
+// v2.10.13: 实况云况分析（红外云检测统计 + 云顶高度分层），按当前卫星数据源切换
 function loadFy4Cloud(){
   const box=$('fy4CloudBox');if(!box)return;
   const lat=+$('lat').value,lon=+$('lon').value;
-  fetch('/api/fy4-cloud?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  fetch('/api/fy4-cloud?lat='+lat+'&lon='+lon+'&src='+_fcSrc,{cache:'no-store'}).then(r=>r.json()).then(j=>{
     if(!j.ok||!j.data)throw Error((j.error||'暂无数据'));
     box.innerHTML=renderFy4Cloud(j.data);
     loadFy4Gibs();
   }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">云况分析加载失败：'+e.message+'</div>'}).finally(()=>{loadFireCloud()});
 }
-// v2.10.14: NASA GIBS 卫星云顶高度（Himawari 红外分级 + MODIS CTH 定量）
+// v2.10.14: 卫星云顶高度（Himawari 红外分级 + MODIS CTH 定量 / KMA band13 推算）
 function loadFy4Gibs(){
   const box=$('fy4CloudBox');if(!box)return;
   const lat=+$('lat').value,lon=+$('lon').value;
-  fetch('/api/fy4-cloud/gibs?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+  fetch('/api/fy4-cloud/gibs?lat='+lat+'&lon='+lon+'&src='+_fcSrc,{cache:'no-store'}).then(r=>r.json()).then(j=>{
     if(!j.ok||!j.data)throw Error((j.error||'暂无数据'));
     box.insertAdjacentHTML('beforeend',renderFy4Gibs(j.data));
   }).catch(e=>{box.insertAdjacentHTML('beforeend','<div class="hist-note" style="color:var(--muted);margin-top:10px">卫星云顶高度加载失败：'+e.message+'</div>')});
 }
 function renderFy4Gibs(d){
   const ir=d.ir13,ct=d.cth;
-  let html='<div class="obs-title" style="margin-top:16px">卫星云顶高度 <span class="tag2">NASA GIBS · Himawari 红外 + MODIS 定量（免登录）</span></div>';
+  const isKma=d.src==='kma'||(ct&&ct.source==='GK2A');
+  const tagText=isKma?'KMA 千里眼2A · band_13 红外云顶推算':'NASA GIBS · Himawari 红外 + MODIS 定量（免登录）';
+  let html='<div class="obs-title" style="margin-top:16px">卫星云顶高度 <span class="tag2">'+tagText+'</span></div>';
   if(ir){
     const bar=(v,color,label)=>`<div style="flex:1;min-width:64px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">${label}</div><div style="height:9px;border-radius:5px;background:#edf2f6;overflow:hidden"><div style="height:100%;width:${v}%;background:${color};border-radius:5px"></div></div><div style="font-size:12px;margin-top:3px"><b>${v}%</b></div></div>`;
     html+=`<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">${bar(ir.high_rate,'#8a6bbd','高云 ≥7km')}${bar(ir.mid_rate,'#5fa8ad','中云 3-7km')}${bar(ir.low_rate,'#7fa3b8','低云/晴 <3km')}</div>`;
@@ -3004,9 +3290,10 @@ function renderFy4Cloud(d){
     const bar=(v,color,label)=>{const p=v==null?0:v;return `<div style="flex:1;min-width:70px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">${label}</div><div style="height:9px;border-radius:5px;background:#edf2f6;overflow:hidden"><div style="height:100%;width:${p}%;background:${color};border-radius:5px"></div></div><div style="font-size:12px;margin-top:3px"><b>${v==null?'—':p+'%'}</b></div></div>`};
     topHtml=`<div class="obs-title" style="margin-top:12px">云顶高度分层 <span class="tag2">Open-Meteo 数值模式 · 低/中/高云量（近似）</span></div><div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:6px">${bar(t.low,'#7fa3b8','低云 &lt;2km')}${bar(t.mid,'#5fa8ad','中云 2–6km')}${bar(t.high,'#4c9a6c','高云 &gt;6km')}</div>`;
   }
+  const srcLabel=(d.note&&d.note.indexOf('KMA')>=0)?'KMA 千里眼2A 红外云检测':'风云四号红外云检测';
   const rows=[
-    ['定位','<b>'+c.lat.toFixed(2)+'°N, '+c.lon.toFixed(2)+'°E</b>（卫星 4km 网格 '+c.row+','+c.col+'）'],
-    ['中心像元','<span style="color:'+(c.cloud?'#c25548':'#3e8e6e')+';font-weight:700">'+cTag+'</span>（风云四号红外云检测）'],
+    ['定位','<b>'+c.lat.toFixed(2)+'°N, '+c.lon.toFixed(2)+'°E</b>（卫星网格 '+c.row+','+c.col+'）'],
+    ['中心像元','<span style="color:'+(c.cloud?'#c25548':'#3e8e6e')+';font-weight:700">'+cTag+'</span>（'+srcLabel+'）'],
     ['有云像元','<b style="color:#c25548">'+s.cloudy+' / '+s.total+'</b>（'+s.cloudy_rate+'%）'],
     ['晴空像元','<b style="color:#3e8e6e">'+s.clear+' / '+s.total+'</b>（'+s.clear_rate+'%）'],
     ['云区比例','<b>'+s.cloud_ratio+'%</b> · 晴空比例 <b>'+s.clear_ratio+'%</b>'],
@@ -3017,15 +3304,21 @@ function renderFy4Cloud(d){
   html+=`<div class="obs-note" style="margin-top:10px">${d.note}</div>`;
   return html;
 }
-// v2.10.19: 实时火烧云潜力预报（风云四号 / KMA 千里眼2A 双数据源 + 太阳扇区中高云识别 + 地图丝滑绘制）
+// v2.10.24: 数据源切换升级为全局——云况分析/云顶高度/云图叠加/火烧云全部联动刷新
 let _fcData=null,_fcLayer=null,_fcSrc='fy4';
 function switchFireSrc(src){
   if(src===_fcSrc)return;
   _fcSrc=src;
+  // 火烧云模块切换提示
   const box=$('fireCloudBox');if(box)box.innerHTML=src==='kma'
     ?'<div class="obs-load">☁ 正在下载 KMA 千里眼2A 卫星图（国际带宽较慢，约需 20-40 秒），请稍候…</div>'
     :'<div class="obs-load">☁ 正在切换数据源分析太阳方向中高云…</div>';
-  loadFireCloud();
+  // 重新加载云况分析（含云顶高度），内部 finally 会再调 loadFireCloud
+  loadFy4Cloud();
+  // 云图叠加若已开启，则跟随切换到对应卫星云图
+  if(_wmSat){_wmSat=null;if(_wmSatLayer){_wmMap.removeLayer(_wmSatLayer);_wmSatLayer=null}if(_wmAnimUrl){URL.revokeObjectURL(_wmAnimUrl);_wmAnimUrl=null}}
+  const satBtn=document.querySelector('.wm-ctl [data-wm-sat="'+(src==='kma'?'kma':'fy4')+'"]');
+  if(satBtn){toggleFy4Sat(satBtn)}
 }
 function loadFireCloud(){
   const box=$('fireCloudBox');if(!box)return;
