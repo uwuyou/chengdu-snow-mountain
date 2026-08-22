@@ -2754,7 +2754,10 @@ def export_history_xlsx(observer, start_date, end_date):
             except Exception:
                 syn = None
         if syn is None:
-            syn = open_meteo_synoptic(observer, model="best_match")
+            try:
+                syn = open_meteo_synoptic(observer, model="best_match")
+            except Exception:
+                syn = None
         for m in MOUNTAINS:
             try:
                 terrain = path_terrain(observer, m, len(meteo[m["id"]]))
@@ -3251,7 +3254,11 @@ def build_forecast(observer, model="best_match"):
         except Exception:
             syn = None
     if syn is None:
-        syn = open_meteo_synoptic(observer, model=model)
+        try:
+            syn = open_meteo_synoptic(observer, model=model)
+        except Exception:
+            syn = None
+            warnings.append("天气形势数据不可用（已降级）")
     # v2.3/v3.x: 数据源限流/故障时回退到缓存，页面给出提示
     if weather_from != "gfs": warnings.append("数值直取不可用，已回退天气数据源")
     if meteo_stale: warnings.append("天气数据源繁忙，本次为缓存预报（可能滞后）")
