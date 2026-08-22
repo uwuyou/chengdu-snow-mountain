@@ -219,8 +219,11 @@ def cache_get(key, max_age):
             return item[1]
     if not key.startswith(_PERSIST_PREFIXES):
         return None
-    ts, value = _cache_load_disk(key)
-    return value if (value is not None and ts is not None and time.time() - ts < max_age) else None
+    loaded = _cache_load_disk(key)
+    if loaded is None:
+        return None
+    ts, value = loaded
+    return value if time.time() - ts < max_age else None
 
 
 def cache_get_stale(key, max_age):
