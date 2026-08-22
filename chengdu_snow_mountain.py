@@ -846,6 +846,42 @@ def _fy4_irx_anim_impl(now):
 # ---- v2.10.13: 风云四号实况云况分析（近似云掩膜 CLM + 云顶高度分层） ----
 # 云掩膜：NSMC WMS GEOS_IRX 二值云检测图（白=云、黑=晴，已用 18 个机场 METAR 交叉验证）。
 # 云顶分层：Open-Meteo 数值模式低/中/高云量近似（无 API Key 的替代方案）。
+def _fy4_irx_latest():
+    """拉取最新风云四号红外灰度图（700x700，白=云），带重试 + 5 分钟共享缓存。
+    v2.10.18: 云况分析与火烧云共用同一张图，避免重复请求并提高成功率。
+    返回 (datetime字符串, PIL灰度图) 或 (None, None)。"""
+    cached = cache_get("obs:irximg", 300)
+    if cached is not None:
+        return cached
+    for attempt in (1, 2):
+        try:
+            r = SESSION.get(FY4_WMS_TIME_URL, timeout=20)
+            r.raise_for_status()
+            ds = (r.json().get("ds") or [])
+            if not ds:
+                return None, None
+            latest = ds[-1]
+            dt = latest["dataDate"] + (latest["dataTime"] or "")[:4]
+            r2 = SESSION.get(FY4_WMS_BASE, params={
+                "layers": "GEOS_IRX", "datetime": dt, "request": "GetMap",
+                "bbox": FY4_WMS_BBOX, "width": FY4_WMS_W, "height": FY4_WMS_H,
+                "version": "1.1.0", "format": "png",
+            }, timeout=30)
+            r2.raise_for_status()
+            if not r2.content or len(r2.content) < 2000:
+                return None, None
+            from PIL import Image as _Img
+            img = _Img.open(io.BytesIO(r2.content)).convert("L")
+            out = (dt, img)
+            cache_put("obs:irximg", out)
+            return out
+        except Exception as e:
+            print(f"[fy4_irx] 第{attempt}次拉取失败 {type(e).__name__}: {e}", flush=True)
+            if attempt == 1:
+                time.sleep(1.5)
+    return None, None
+
+
 def fy4_cloud_analysis(lat, lon, now=None):
     """返回观测点及周边风云四号红外云检测统计 + 云顶高度分层，缓存 10 分钟。失败返回 None。"""
     key = f"obs:fy4clm:{float(lat):.2f},{float(lon):.2f}"
@@ -853,23 +889,10 @@ def fy4_cloud_analysis(lat, lon, now=None):
     if cached is not None: return cached
     try:
         now = now or datetime.now(TZ)
-        # 1) 最新时次（与红外云图同一接口）
-        r = SESSION.get(FY4_WMS_TIME_URL, timeout=20)
-        r.raise_for_status()
-        ds = (r.json().get("ds") or [])
-        if not ds: return None
-        latest = ds[-1]
-        dt = latest["dataDate"] + (latest["dataTime"] or "")[:4]
-        # 2) 大范围云检测二值图（bbox 经度跨度需 ≥55°，服务端限制）
-        r2 = SESSION.get(FY4_WMS_BASE, params={
-            "layers": "GEOS_IRX", "datetime": dt, "request": "GetMap",
-            "bbox": FY4_WMS_BBOX, "width": FY4_WMS_W, "height": FY4_WMS_H,
-            "version": "1.1.0", "format": "png",
-        }, timeout=30)
-        r2.raise_for_status()
-        if not r2.content or len(r2.content) < 2000: return None
-        from PIL import Image as _Img
-        img = _Img.open(io.BytesIO(r2.content)).convert("L")
+        # 1) 拉最新风云四号红外灰度图（共享缓存 + 重试）
+        dt, img = _fy4_irx_latest()
+        if img is None:
+            return None
         px = img.load()
         W, H = img.size
         # 地理范围：lon 70→135（x 从左到右），lat 55→10（y 从上到下）
@@ -928,6 +951,113 @@ def fy4_cloud_analysis(lat, lon, now=None):
         return out
     except Exception as e:
         print(f"[fy4_cloud] {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+# ---- v2.10.18: 实时火烧云潜力预报 ----
+# 原理：火烧云 = 日落/日出方向存在「中高云」+ 云量适中 + 太阳接近地平线。
+#   - 中高云识别：风云四号红外云图灰度≈亮温，云顶越冷(灰度高)越高。
+#     灰度 160-255(亮温约 -36℃ 以下) 视为中高云（卷云/高层云，能染红）。
+#   - 太阳方位扇区：取太阳方位角 ±70° 扇形内的云，是火烧云真正会出现的天空范围。
+#   - 评分：扇区内中高云覆盖率 15%-75% 最佳 + 云顶冷度 + 太阳高度角窗口(-6°~+6°)。
+# 输出：潜力评分 + 可绘制范围 GeoJSON（栅格→多边形，供前端丝滑渐变叠加）。
+
+def _azimuth_diff(a, b):
+    """两方位角(0-360)之差，返回 0-180。"""
+    d = abs(a - b) % 360
+    return d if d <= 180 else 360 - d
+
+def fire_cloud_forecast(lat, lon, now=None):
+    """实时火烧云潜力预报。返回 dict 或 None。缓存 10 分钟。"""
+    key = f"obs:firec:{float(lat):.2f},{float(lon):.2f}"
+    cached = cache_get(key, 600)
+    if cached is not None: return cached
+    try:
+        now = now or datetime.now(TZ)
+        elev, az = solar_position(now, lat, lon)
+        # 1) 拉最新风云四号红外灰度图（共享缓存 + 重试）
+        dt, img = _fy4_irx_latest()
+        if img is None:
+            return None
+        px = img.load(); W, H = img.size
+        # 2) 地理映射（与 fy4_cloud_analysis 相同）
+        lon0, lon1, lat1, lat0 = 70.0, 135.0, 55.0, 10.0
+        # 3) 逐像元判断：是否中高云 + 是否在太阳扇区内 + 是否在有效半径内
+        SECTOR = 70.0          # 太阳方位 ±70° 扇区
+        MAX_DIST = 1500.0      # 有效半径 km（火烧云只看观测点周边，避免全境噪声）
+        CELL = 3               # 抽样步长（约 12km 网格）
+        mid_high = []          # 中高云像元 (lon, lat, 灰度)
+        n_sector_total = n_sector_cloud = n_sector_midhigh = 0
+        for yy in range(0, H, CELL):
+            lat_y = lat1 - (lat1 - lat0) * (yy + 0.5) / H
+            for xx in range(0, W, CELL):
+                g = px[xx, yy]
+                if g < 40:  # 无云/晴空
+                    continue
+                lon_x = lon0 + (lon1 - lon0) * (xx + 0.5) / W
+                # 像元相对观测点的距离与方位
+                dist, bearing = haversine_bearing(lat, lon, lat_y, lon_x)
+                if dist > MAX_DIST or _azimuth_diff(bearing, az) > SECTOR:
+                    continue
+                n_sector_total += 1
+                if g >= 128:
+                    n_sector_cloud += 1
+                if g >= 160:  # 中高云（云顶较冷）
+                    n_sector_midhigh += 1
+                    mid_high.append((lon_x, lat_y, g))
+        if n_sector_total < 20:
+            return None  # 太阳扇区内数据不足
+        sector_cloud_rate = n_sector_cloud / n_sector_total * 100
+        sector_mh_rate = n_sector_midhigh / n_sector_total * 100
+        # 4) 评分因子
+        #   a) 中高云覆盖率：15%-75% 最佳，过高过低都扣分
+        if 15 <= sector_mh_rate <= 75:
+            s_cover = 100 - abs(sector_mh_rate - 40) * 1.2   # 40% 附近最优
+        else:
+            s_cover = max(0, 100 - abs(sector_mh_rate - 40) * 2.5)
+        #   b) 云顶冷度：平均灰度越高（越冷）越容易染红
+        if mid_high:
+            avg_g = sum(x[2] for x in mid_high) / len(mid_high)
+            s_cold = min(100, (avg_g - 150) * 1.8)
+        else:
+            avg_g, s_cold = 0, 0
+        #   c) 太阳高度角窗口：-6°(黎明前/黄昏后) ~ +6° 最佳
+        if -8 <= elev <= 8:
+            s_sun = 100 - abs(elev) * 9
+        else:
+            s_sun = max(0, 55 - abs(elev) * 4)  # 太阳太高则潜力快速衰减
+        score = int(round(0.5 * s_cover + 0.3 * s_cold + 0.2 * s_sun))
+        score = max(0, min(100, score))
+        # 5) 时段判断
+        is_window = -10 <= elev <= 10   # 日出日落黄金窗口
+        phase = ("黎明（日出）" if az < 180 else "黄昏（日落）") if is_window else \
+                ("白天（太阳偏高）" if elev > 10 else "夜间（太阳低于地平线）")
+        # 6) 绘制范围：中高云像元集合（前端 Canvas 半透明渐变"丝滑"渲染）
+        #    像元过多时按采样率抽稀，控制载荷 ≤ 2500 点
+        if len(mid_high) > 2500:
+            step = math.ceil(len(mid_high) / 2500)
+            mid_high = mid_high[::step]
+        cells = [{"lon": round(x, 3), "lat": round(y, 3), "g": g_} for x, y, g_ in mid_high]
+        t_utc = datetime.strptime(dt, "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        out = {
+            "ok": True,
+            "time_utc": dt, "time_bj": t_utc.astimezone(TZ).isoformat(),
+            "sun": {"elev": round(elev, 1), "az": round(az, 1), "phase": phase},
+            "score": score,
+            "level": "高" if score >= 70 else ("中" if score >= 45 else ("低" if score >= 25 else "无")),
+            "sector": {"az_center": round(az, 1), "half_width": SECTOR, "max_dist_km": int(MAX_DIST),
+                       "cloud_rate": round(sector_cloud_rate, 1),
+                       "midhigh_rate": round(sector_mh_rate, 1),
+                       "avg_gray": round(avg_g, 1) if mid_high else None},
+            "window": is_window,
+            "cells": cells,
+            "note": "火烧云潜力 = 观测点周边1500km内、日落/日出方向中高云覆盖率 + 云顶冷度 + 太阳高度角综合；"
+                    "中高云（卷云/高层云）最易被染红，云量适中(15-75%)最佳。绘制范围为太阳扇区内中高云区域。",
+        }
+        cache_put(key, out)
+        return out
+    except Exception as e:
+        print(f"[fire_cloud] {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -2110,6 +2240,22 @@ def api_fy4_cloud():
         return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
 
 
+@APP.get("/api/fire-cloud")
+def api_fire_cloud():
+    """v2.10.18 实时火烧云潜力预报：太阳方位扇区内中高云识别 + 潜力评分 + 绘制范围。"""
+    try:
+        lat = float(request.args.get("lat", DEFAULT_OBSERVER["lat"]))
+        lon = float(request.args.get("lon", DEFAULT_OBSERVER["lon"]))
+        data = fire_cloud_forecast(lat, lon)
+        if not data:
+            return jsonify({"ok": False, "error": "火烧云预报暂不可用（数据源无响应或太阳扇区内云数据不足）"}), 502
+        resp = jsonify({"ok": True, "data": data})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"{type(e).__name__}: {e}"}), 400
+
+
 @APP.get("/api/fy4-cloud/gibs")
 def api_fy4_cloud_gibs():
     """v2.10.14 NASA GIBS 卫星云顶高度：Himawari 红外分级 + MODIS CTH 定量统计。"""
@@ -2255,7 +2401,7 @@ HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta n
 @media(max-width:780px){.wm-map{height:320px}.wm-ctl .grp{width:100%}}
 </style></head><body><div class="wrap"><div class="hero"><div><h1>成都 · 看雪山</h1><p>数值预报 × 观山经验 综合测算观测指数</p></div><button class="primary" onclick="loadAll()">刷新全部数据</button></div>
 <nav class="tabs-nav"><button class="tab-btn active" data-tab="fc" onclick="switchTab('fc')">天气预报</button><button class="tab-btn" data-tab="live" onclick="switchTab('live')">实况观测</button><button class="tab-btn" data-tab="hist" onclick="switchTab('hist')">历史回顾</button><button class="tab-btn" data-tab="kb" onclick="switchTab('kb')">观山知识</button><button class="tab-btn" data-tab="windy" onclick="switchTab('windy')">Windy 实况</button><button class="tab-btn" data-tab="wm" onclick="switchTab('wm')">卫星云图</button></nav>
-<div id="pane-live" class="tab-pane"><div class="panel"><div class="obs-title">观测点地图 <span class="tag2">拖动蓝点调整观测位置 · 松手自动刷新实况与云量趋势</span></div><div id="liveMap"></div><div class="legend"><span>● 观测点（可拖动）</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">当前天气实况 <span class="tag2">中央气象台站点观测 + Open-Meteo 当前时次</span></div><div id="currentBox"><div class="cur-panel" style="justify-content:center;color:var(--muted);font-size:13px">正在获取实况观测…</div></div></div><div id="obsBox" class="panel obs-panel" style="display:none"></div><div class="panel" style="margin-top:12px"><div class="obs-title">风云四号实况云况分析 <span class="tag2">红外云检测（白=云）· 跟随当前观测点 · 自动刷新</span></div><div id="fy4CloudBox"><div class="hist-note" style="color:var(--muted)">正在获取风云四号云况分析…</div></div></div></div>
+<div id="pane-live" class="tab-pane"><div class="panel"><div class="obs-title">观测点地图 <span class="tag2">拖动蓝点调整观测位置 · 松手自动刷新实况与云量趋势</span></div><div id="liveMap"></div><div class="legend"><span>● 观测点（可拖动）</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">当前天气实况 <span class="tag2">中央气象台站点观测 + Open-Meteo 当前时次</span></div><div id="currentBox"><div class="cur-panel" style="justify-content:center;color:var(--muted);font-size:13px">正在获取实况观测…</div></div></div><div id="obsBox" class="panel obs-panel" style="display:none"></div><div class="panel" style="margin-top:12px"><div class="obs-title">风云四号实况云况分析 <span class="tag2">红外云检测（白=云）· 跟随当前观测点 · 自动刷新</span></div><div id="fy4CloudBox"><div class="hist-note" style="color:var(--muted)">正在获取风云四号云况分析…</div></div></div><div class="panel" style="margin-top:12px"><div class="obs-title">火烧云潜力预报 <span class="tag2">风云四号红外云图 · 太阳方向中高云识别 · 10 分钟缓存</span></div><div id="fireCloudBox"><div class="hist-note" style="color:var(--muted)">正在分析太阳方向中高云分布…</div></div></div></div>
 <div id="pane-fc" class="tab-pane active"><div class="grid"><section class="panel"><div class="obs-title">预报设置 <span class="tag2">观测点 · 海拔 · 模型</span></div><div class="inputs"><label>纬度<input id="lat" value="{{observer.lat}}"></label><label>经度<input id="lon" value="{{observer.lon}}"></label><label>海拔 m（自动）<input id="elev" value="读取中" readonly></label><label>地点<input id="name" value="{{observer.name}}"></label><label class="wide">天气预报数据源<select id="model" onchange="loadAll()"><option value="best_match">智能最佳匹配（推荐）</option><option value="ecmwf_ifs025">ECMWF IFS 0.25°</option><option value="gfs_seamless">NOAA GFS</option><option value="icon_seamless">DWD ICON</option><option value="cma_grapes_global">中国气象局 CMA GRAPES</option><option value="jma_seamless">日本气象厅 JMA</option></select></label></div><div class="actions"><button onclick="locate()">手机定位</button><button onclick="loadAll()">更新全部数据</button></div><div id="modelStatus" class="status" style="display:none">天气模型：正在获取…</div><div id="aerosol" class="status" style="display:none">气溶胶：正在获取 Open-Meteo 数据…</div></section><section class="panel"><div class="obs-title">观测地图 <span class="tag2">可拖动观测点 · 海拔分区</span></div><div id="map"></div><div class="legend"><span>● 观测点</span><span style="color:#8a6d3b">● 雪山</span><span>线段 = 实际观测方向</span><span style="color:#d64541">● 云层遮挡视线</span><span style="color:#4a9d78">■ 低海拔 &lt;1500m</span><span style="color:#c98a2b">■ 中海拔 1500–3500m</span><span style="color:#8a6bbd">■ 高海拔 ≥3500m</span></div></section></div>
 <div id="cards" class="cards"></div></div>
 <div id="pane-hist" class="tab-pane"><div class="hist-ctl"><label>起始日期<input type="date" id="hStart"></label><label>结束日期<input type="date" id="hEnd"></label><button class="primary" onclick="queryHistory()">查询回顾</button><button onclick="exportHistory()">导出为 Excel</button><div class="spacer"></div><div class="hint">支持任意历史日期（ERA5 再分析，1940 年至今），单次跨度最多 90 天；近 92 天含气溶胶 AOD 数据，更早则无 AOD（评分自动降级）。导出文件含「每日评分」与「历史 vs 预报趋势对比」两个工作表。</div></div>
@@ -2311,6 +2457,8 @@ if(window._mainOm)window._mainOm.setLatLng(wgsToGcj(w[0],w[1]));
 // v2.10.3: 实况联动——云图叠加标注 + 未来云量趋势 + 当前实况 + 预报
 syncCloudMapOverlay();loadCurrent();loadFy4Cloud();
 clearTimeout(_dragTimer);_dragTimer=setTimeout(()=>loadAll(),1200)});
+// v2.10.18: 实况地图缩放时重绘火烧云范围（保持渐变清晰）
+liveMap.on('zoomend',()=>{if(_fcData)drawFireCloudMap(_fcData,true)});
 function syncLiveOmFromMain(){if(typeof liveOm!=='undefined'){const g=wgsToGcj(+$('lat').value,+$('lon').value);liveOm.setLatLng(g)}}
 let lastData=null;
 let blockedLayer=L.layerGroup();
@@ -2550,7 +2698,7 @@ function loadFy4Cloud(){
     if(!j.ok||!j.data)throw Error((j.error||'暂无数据'));
     box.innerHTML=renderFy4Cloud(j.data);
     loadFy4Gibs();
-  }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">云况分析加载失败：'+e.message+'</div>'});
+  }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">云况分析加载失败：'+e.message+'</div>'}).finally(()=>{loadFireCloud()});
 }
 // v2.10.14: NASA GIBS 卫星云顶高度（Himawari 红外分级 + MODIS CTH 定量）
 function loadFy4Gibs(){
@@ -2606,6 +2754,98 @@ function renderFy4Cloud(d){
   html+=topHtml;
   html+=`<div class="obs-note" style="margin-top:10px">${d.note}</div>`;
   return html;
+}
+// v2.10.18: 实时火烧云潜力预报（风云四号红外 + 太阳扇区中高云识别 + 地图丝滑绘制）
+let _fcData=null,_fcLayer=null;
+function loadFireCloud(){
+  const box=$('fireCloudBox');if(!box)return;
+  const lat=+$('lat').value,lon=+$('lon').value;
+  fetch('/api/fire-cloud?lat='+lat+'&lon='+lon,{cache:'no-store'}).then(r=>r.json()).then(j=>{
+    if(!j.ok||!j.data)throw Error(j.error||'暂无数据');
+    _fcData=j.data;
+    box.innerHTML=renderFireCloud(j.data);
+    drawFireCloudMap(j.data,true);
+  }).catch(e=>{box.innerHTML='<div class="hist-note" style="color:var(--red)">火烧云预报加载失败：'+e.message+'</div>'});
+}
+function renderFireCloud(d){
+  const lv=d.level==='高'?'#e05a2b':d.level==='中'?'#c07f2a':d.level==='低'?'#8aa0b0':'#9aa8b5';
+  const sun=d.sun,s=d.sector,t=new Date(d.time_bj);
+  const pct=Math.max(0,Math.min(100,s.midhigh_rate));
+  let html='<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:8px">';
+  html+=`<div style="min-width:96px;padding:12px 10px;border-radius:12px;background:linear-gradient(135deg,#fdf0e4,#f6dcc2);text-align:center"><div style="font-size:11px;color:#a06a1f">潜力评分</div><div style="font-size:26px;font-weight:800;color:${lv}">${d.score}</div><div style="font-size:11px;font-weight:700;color:${lv}">${d.level}</div></div>`;
+  html+=`<div style="flex:1;min-width:210px"><div style="font-size:11px;color:var(--muted);margin-bottom:4px">太阳方向扇区中高云占比（卷云/高层云最易染红）</div><div style="display:flex;height:12px;border-radius:6px;overflow:hidden;background:#edf2f6"><div style="width:${pct}%;background:linear-gradient(90deg,#ffb27a,#e05a2b)"></div></div><div style="display:flex;gap:12px;font-size:11.5px;margin-top:4px"><span>中高云 <b>${s.midhigh_rate}%</b></span><span>总云量 ${s.cloud_rate}%</span><span style="color:var(--muted)">${t.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})} 时次</span></div></div></div>`;
+  const rows=[
+    ['时段','<b>'+sun.phase+'</b>（太阳方位 '+sun.az+'° · 高度角 '+sun.elev+'°）'],
+    ['扇区','太阳方位 ±'+s.half_width+'° 扇形内统计'],
+    ['云顶冷度',s.avg_gray!=null?'平均灰度 <b>'+s.avg_gray+'</b>（越高越冷）':'无中高云'],
+    ['黄金窗口',d.window?'<b style="color:#e05a2b">处于日出/日落 ±10° 窗口</b>':'当前不在日出/日落窗口'],
+  ];
+  html+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:12px">'+rows.map(r=>`<div style="background:var(--soft);border-radius:8px;padding:8px 10px;font-size:12px"><div style="color:var(--muted);font-size:11px;margin-bottom:2px">${r[0]}</div>${r[1]}</div>`).join('')+'</div>';
+  html+='<div class="obs-note" style="margin-top:10px">'+d.note+'</div>';
+  html+=`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px"><button onclick="fitFireCloud()" style="padding:7px 12px;font-size:12px">定位到火烧云范围</button><span style="font-size:11px;color:var(--muted)">地图浅黄扇区=太阳观测窗口；橙红渐变=中高云分布范围</span></div>`;
+  return html;
+}
+function destPtWgs(lat,lon,km,azDeg){
+  const R=6371,br=azDeg*Math.PI/180,d=km/R,la=lat*Math.PI/180,lo=lon*Math.PI/180;
+  const la2=Math.asin(Math.sin(la)*Math.cos(d)+Math.cos(la)*Math.sin(d)*Math.cos(br));
+  const lo2=lo+Math.atan2(Math.sin(br)*Math.sin(d)*Math.cos(la),Math.cos(d)-Math.sin(la)*Math.sin(la2));
+  return [la2*180/Math.PI,lo2*180/Math.PI];
+}
+function drawFireCloudMap(d,fast){
+  const map=liveMap;if(!map)return;
+  if(_fcLayer){map.removeLayer(_fcLayer);_fcLayer=null}
+  const grp=L.layerGroup();
+  const lat=+$('lat').value,lon=+$('lon').value;
+  const az=d.sun.az,hw=d.sector.half_width;
+  // 1) 太阳观测扇区（±70° 楔形，900km 半径，圆弧平滑拟合）
+  const arc=[[lat,lon]];
+  for(let k=0;k<=60;k++){const a=az-hw+(2*hw)*k/60;const p=destPtWgs(lat,lon,900,a);arc.push(wgsToGcj(p[0],p[1]))}
+  arc.push([lat,lon]);
+  L.polygon(arc,{color:'#d9a83f',weight:1,dashArray:'4 6',fillColor:'#ffd27a',fillOpacity:.13,interactive:false}).addTo(grp);
+  // 太阳方位指示线 + 标注
+  const sp=destPtWgs(lat,lon,620,az),sg=wgsToGcj(sp[0],sp[1]),og=wgsToGcj(lat,lon);
+  L.polyline([og,sg],{color:'#e0a93f',weight:1.6,dashArray:'3 7',interactive:false}).addTo(grp);
+  L.marker(sg,{icon:L.divIcon({className:'',html:'<div style="transform:translate(-50%,-100%);white-space:nowrap;font-size:11px;font-weight:700;color:#b07a1f;background:rgba(255,255,255,.88);border:1px solid #ecd9a8;border-radius:6px;padding:2px 7px">太阳方位 '+Math.round(az)+'°</div>',iconSize:[0,0]})}).addTo(grp);
+  // 2) 中高云分布范围：Canvas 径向渐变叠加（半透明像元融合出"丝滑"云区）
+  const cells=d.cells||[];
+  const msz=map.getSize();
+  if(cells.length&&msz.x>0&&msz.y>0){
+    let minLat=90,maxLat=-90,minLon=181,maxLon=-181;
+    cells.forEach(c=>{if(c.lat<minLat)minLat=c.lat;if(c.lat>maxLat)maxLat=c.lat;if(c.lon<minLon)minLon=c.lon;if(c.lon>maxLon)maxLon=c.lon});
+    const nw=map.latLngToContainerPoint(wgsToGcj(maxLat,minLon));
+    const se=map.latLngToContainerPoint(wgsToGcj(minLat,maxLon));
+    let W=Math.abs(se.x-nw.x),H=Math.abs(se.y-nw.y);
+    if(W>4&&H>4){
+      const sc=Math.min(1,2600/Math.max(W,H));W=Math.round(W*sc);H=Math.round(H*sc);
+      const cv=document.createElement('canvas');cv.width=W;cv.height=H;
+      const ctx=cv.getContext('2d');
+      const mpp=156543.03392*Math.cos(map.getCenter().lat*Math.PI/180)/Math.pow(2,map.getZoom());
+      const rPx=Math.max(6,(map.getZoom()>=8?30:44)*1000/mpp*sc);
+      const bnds=[[maxLat,minLon],[minLat,maxLon]].map(ll=>wgsToGcj(ll[0],ll[1]));
+      cells.forEach(c=>{
+        const p=map.latLngToContainerPoint(wgsToGcj(c.lat,c.lon));
+        const x=(p.x-nw.x)*sc,y=(p.y-nw.y)*sc;
+        if(x<-rPx||y<-rPx||x>W+rPx||y>H+rPx)return;
+        const t=Math.max(0,Math.min(1,(c.g-160)/95));
+        const rr=Math.round(255-55*t),gg=Math.round(70+60*t),bb=Math.round(58-22*t);
+        const g=ctx.createRadialGradient(x,y,0,x,y,rPx);
+        g.addColorStop(0,`rgba(${rr},${gg},${bb},.6)`);
+        g.addColorStop(.55,`rgba(${rr},${gg},${bb},.24)`);
+        g.addColorStop(1,`rgba(${rr},${gg},${bb},0)`);
+        ctx.fillStyle=g;ctx.beginPath();ctx.arc(x,y,rPx,0,Math.PI*2);ctx.fill();
+      });
+      const ov=L.imageOverlay(cv.toDataURL(),bnds,{opacity:fast?0.92:0,interactive:false}).addTo(grp);
+      if(!fast)setTimeout(()=>{ov.setOpacity(.92)},30);
+    }
+  }
+  _fcLayer=grp.addTo(map);
+}
+function fitFireCloud(){
+  if(!_fcData||!_fcData.cells||!_fcData.cells.length)return;
+  let minLat=90,maxLat=-90,minLon=181,maxLon=-181;
+  _fcData.cells.forEach(c=>{if(c.lat<minLat)minLat=c.lat;if(c.lat>maxLat)maxLat=c.lat;if(c.lon<minLon)minLon=c.lon;if(c.lon>maxLon)maxLon=c.lon});
+  const b=[[maxLat,minLon],[minLat,maxLon]].map(ll=>wgsToGcj(ll[0],ll[1]));
+  switchTab('live');setTimeout(()=>liveMap.fitBounds(b,{padding:[24,24],maxZoom:7}),80);
 }
 // v2.9.8: 西南区域裁剪放大（CSS 定位+缩放，避免跨域图片污染 canvas）
 function zoomSat(img){
