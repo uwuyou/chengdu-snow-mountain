@@ -3085,10 +3085,10 @@ def estimate_visibility(rh, precip, aod=None, cloud_low=None):
     if rh >= 95: return 1400.0
     if rh >= 93: return 2500.0
     if rh >= 90: return 4500.0
-    if rh >= 87: return 7000.0
-    if rh >= 84: return 9500.0
-    if rh >= 78: return 13000.0
-    base = 22000.0 if rh >= 60 else 28000.0
+    # v3.x: 此前中湿档(rh 60-90)在气溶胶衰减前直接 return，导致盆地霾(高AOD+中等湿度)
+    # 常见场景能见度被高估。改为先按湿度取档位下限，再统一叠加气溶胶 Koschmieder 衰减。
+    base = 7000.0 if rh >= 87 else (9500.0 if rh >= 84 else
+            (13000.0 if rh >= 78 else (22000.0 if rh >= 60 else 28000.0)))
     # 气溶胶衰减（Koschmieder：V = 3.912 / b_ext，消光系数 ∝ AOD）
     if aod is not None:
         try:
@@ -3125,13 +3125,19 @@ def score_hour(dt, mountain, corridor, observer, air, terrain, syn=None):
     for i in range(len(corridor)):
         arr = corridor[i].get("visibility") or []
         raw = arr[idx] if idx < len(arr) and arr[idx] is not None else None
-        if raw is not None:
-            try: vis.append(float(raw)); continue
-            except (TypeError, ValueError): pass
         pre = corridor[i].get("precipitation") or []
         pv = pre[idx] if idx < len(pre) and pre[idx] is not None else 0.0
         ap = air_points[i] if i < len(air_points) else {}
-        vis.append(estimate_visibility(rh[i], pv, ap.get("aerosol_optical_depth"), low[i]))
+        # v3.x: GFS 地表 VIS 为离散档位且晴天固定偏高(约24km)，无法体现盆地霾/雾随气溶胶与
+        # 湿度的削减。无论模型值是否存在，都取「模型 VIS」与「物理估算(湿度+降水+气溶胶
+        # Koschmieder+低云)」的较小者——霾/雾天能见度如实下降，通透晴天维持高位。
+        est = estimate_visibility(rh[i], pv, ap.get("aerosol_optical_depth"), low[i])
+        if raw is not None:
+            try:
+                vis.append(min(float(raw), est)); continue
+            except (TypeError, ValueError):
+                pass
+        vis.append(est)
     wind = vals("wind_speed_10m")
     # v2.0: 前12h降水只看近观测端 3 个点（盆地内），避免走廊全线求和夸大。
     rain12 = 0.0
