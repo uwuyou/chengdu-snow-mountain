@@ -2602,9 +2602,10 @@ def open_meteo_archive_synoptic(observer, start_date, end_date):
         return None
 
 
-def synoptic_factors(syn, dt):
+def synoptic_factors(syn, dt, aod=None):
     """检测天气系统因子。返回 (facts字典, 加分, 理由列表)。
-    等压面数据可用→完整检测；仅地面数据→近似检测（历史回顾）。"""
+    等压面数据可用→完整检测；仅地面数据→近似检测（历史回顾）。
+    v3.x: 逆温层"霾滞留"惩罚按实际 AOD 调制——空气已干净(AOD低)时逆温不罚。"""
     if not syn:
         return {"available": False}, 0.0, []
     times = syn.get("time") or []
@@ -2620,26 +2621,35 @@ def synoptic_factors(syn, dt):
         except (TypeError, ValueError): return None
     # 等压面可用 → 完整检测
     if any(x is not None for x in (syn.get("temperature_850hPa") or [])[:6]):
-        return _synoptic_full(at, syn, dt)
+        return _synoptic_full(at, syn, dt, aod)
     # 仅地面 → 近似检测
     return _synoptic_approx(at, dt)
 
 
-def _synoptic_full(at, syn, dt):
+def _synoptic_full(at, syn, dt, aod=None):
     t2m, t850, t925, t1000 = at("temperature_2m"), at("temperature_850hPa"), at("temperature_925hPa"), at("temperature_1000hPa")
     ws850, wd850 = at("wind_speed_850hPa"), at("wind_direction_850hPa")
     ws10, wd10 = at("wind_speed_10m"), at("wind_direction_10m")
     gph, gph24 = at("geopotential_height_850hPa"), at("geopotential_height_850hPa", 24)
     t850_24 = at("temperature_850hPa", 24)
     facts = {"available": True}; bonus = 0.0; notes = []
+    # v3.x: 逆温层对霾的惩罚按实际 AOD 调制。AOD 低(空气干净)时逆温不会导致霾，
+    # 仅在 AOD≥0.3(确有气溶胶)时全额惩罚；AOD 未知时仍按原逻辑。
+    aod_factor = 1.0
+    if aod is not None:
+        try:
+            aod_f = float(aod)
+            aod_factor = max(0.15, min(1.0, aod_f / 0.3))
+        except (TypeError, ValueError):
+            pass
     # ---- 逆温层：T1000−T850 正常 6~9°C；≤4 即有逆温/等温倾向（霾层滞留的物理机制） ----
     if t1000 is not None and t850 is not None:
         diff = t1000 - t850
         facts["inversion_strength"] = round(diff, 1)
         if diff <= 1:
-            bonus -= 8; facts["inversion"] = "强"; notes.append("强逆温层：低层污染物难扩散")
+            bonus -= 8 * aod_factor; facts["inversion"] = "强"; notes.append("强逆温层：低层污染物难扩散")
         elif diff <= 4:
-            bonus -= 4; facts["inversion"] = "弱"; notes.append("逆温/等温层：霾易滞留")
+            bonus -= 4 * aod_factor; facts["inversion"] = "弱"; notes.append("逆温/等温层：霾易滞留")
         else:
             facts["inversion"] = "无"
     # ---- 冷空气：24h 850hPa 变温 + 季节温度水平（槽后冷平流） ----
@@ -3039,9 +3049,14 @@ def radiation_fog_risk(dt, corridor, idx, rh3, wind3, cloud3, syn_facts):
         return None, 0.0, ""
     # 晴夜条件：前夜（0-8 时）云量少，利于辐射冷却
     cc = [x for x in (cloud3 or []) if x is not None]
+    # v3.x: 辐射雾的必要条件是近地面高湿（露点接近气温）。
+    # rh3 最大值 < 80 时不可能形成辐射雾（水汽不足，无法凝结），直接返回不评估。
+    rh_max = max(rh3) if rh3 else 0
+    if rh_max < 80:
+        return None, 0.0, ""
     clear_night = (not cc) or (sum(cc)/len(cc) <= 35)
     calm = (not wind3) or (max(wind3) <= 3.0)
-    humid = (not rh3) or (max(rh3) >= 88)
+    humid = rh_max >= 88
     inversion = bool(syn_facts and syn_facts.get("inversion") and syn_facts.get("inversion") != "无")
     # 多日未雨有利于雾形成（水汽在地面附近，无降水扰动）
     dry = True
@@ -3050,13 +3065,13 @@ def radiation_fog_risk(dt, corridor, idx, rh3, wind3, cloud3, syn_facts):
     lo = max(0, idx-48)
     dry = sum(float(v or 0) for v in prec[lo:idx+1]) < 1.0
     score = (1 if clear_night else 0) + (1 if calm else 0) + (1 if humid else 0) + (1 if inversion else 0) + (1 if dry else 0)
-    if score >= 4:
+    if score >= 4 and humid:
         level = "高"
         penalty = 9.0 if (humid and clear_night and calm) else 6.0
-    elif score >= 3:
+    elif score >= 3 and humid:
         level = "中"
         penalty = 4.0
-    elif score >= 2:
+    elif score >= 2 and rh_max >= 84:
         level = "低"
         penalty = 1.5
     else:
@@ -3089,12 +3104,15 @@ def estimate_visibility(rh, precip, aod=None, cloud_low=None):
     # 常见场景能见度被高估。改为先按湿度取档位下限，再统一叠加气溶胶 Koschmieder 衰减。
     base = 7000.0 if rh >= 87 else (9500.0 if rh >= 84 else
             (13000.0 if rh >= 78 else (22000.0 if rh >= 60 else 28000.0)))
-    # 气溶胶衰减（Koschmieder：V = 3.912 / b_ext，消光系数 ∝ AOD）
+    # 气溶胶衰减（Koschmieder：V = 3.912 / β_ext；AOD = β_ext × H_mix）
+    # v3.x: 此前用 18000*exp(-2.2*aod)，AOD=0.17(干净)就压到 12km，严重低估通透天能见度。
+    # 改用混合高度法：V = 3.912 × H_mix / AOD，H_mix=2500m（典型边界层）。
+    # AOD=0.17→30km(封顶), AOD=0.5→19.6km, AOD=1.0→9.8km, AOD=2.0→4.9km，符合观测。
     if aod is not None:
         try:
             aod = float(aod)
-            if aod > 0.05:
-                base = min(base, 18000.0 * math.exp(-2.2 * aod))
+            if aod > 0.02:
+                base = min(base, min(30000.0, 3.912 * 2500.0 / max(aod, 0.01)))
         except (TypeError, ValueError):
             pass
     # 低云罩顶：低云量大且近饱和时视野受限
@@ -3174,7 +3192,8 @@ def score_hour(dt, mountain, corridor, observer, air, terrain, syn=None):
     wind_b = 3.0 if 8 <= wind_avg <= 28 else 0
     empirical_bonus = washout - haze + season + window + clear + wind_b
     # v2.8: 天气系统因子（冷空气/锋面切变/槽脊/逆温层）独立计入总分
-    syn_facts, syn_bonus, syn_notes = synoptic_factors(syn, dt)
+    # v3.x: 传入 AOD，逆温"霾滞留"惩罚按实际气溶胶调制
+    syn_facts, syn_bonus, syn_notes = synoptic_factors(syn, dt, aod)
     # v2.8: 辐射雾风险（晴夜+静风+高湿+逆温 → 清晨能见度骤降，直接扣分）
     fog_level, fog_penalty, fog_note = radiation_fog_risk(dt, corridor, idx, rh[:3], wind[:3], vals("cloud_cover"), syn_facts)
     score = round(clamp(100*base*range_factor+empirical_bonus+syn_bonus-fog_penalty,0,100))
